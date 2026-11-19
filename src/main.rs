@@ -10,6 +10,9 @@ use std::process::Command;
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
+mod selfupdate;
+use selfupdate::SelfUpdate;
+
 const UNIT_DIR: &str = "/etc/systemd/system";
 const UNIT_PREFIX: &str = "watts-gpu-power";
 
@@ -281,12 +284,13 @@ struct App {
     job: Option<mpsc::Receiver<Result<String, String>>>,
     msg: Option<Result<String, String>>,
     hook: TestHook,
+    update: SelfUpdate,
 }
 
 impl App {
     fn new(cc: &eframe::CreationContext) -> Self {
         style(&cc.egui_ctx);
-        App { live: spawn_monitor(cc.egui_ctx.clone()), units: read_units(), selected: String::new(), target: None, job: None, msg: None, hook: TestHook::default() }
+        App { live: spawn_monitor(cc.egui_ctx.clone()), units: read_units(), selected: String::new(), target: None, job: None, msg: None, hook: TestHook::default(), update: SelfUpdate::new() }
     }
 
     fn start(&mut self, job: Job, ctx: &egui::Context) {
@@ -536,11 +540,25 @@ impl eframe::App for App {
                     };
                 }
                 ui.add_space(4.0);
-                small(ui, format!("Watts {}", env!("CARGO_PKG_VERSION")));
+                ui.horizontal(|ui| {
+                    small(ui, format!("Watts {}", env!("CARGO_PKG_VERSION")));
+                    let label = if self.update.busy() { "Recherche…" } else { "Rechercher les mises à jour" };
+                    if ui.add_enabled(!self.update.busy(), egui::Button::new(RichText::new(label).size(12.5)).small()).clicked() {
+                        self.update.check_now(ui.ctx());
+                    }
+                    let mut auto = self.update.prefs.automatic;
+                    if ui.checkbox(&mut auto, RichText::new("automatiquement").size(12.5).color(MUTED)).changed() {
+                        self.update.prefs.automatic = auto;
+                        self.update.prefs.save();
+                    }
+                });
             });
         });
+        self.update.ui(ctx, ACCENT, ON_ACCENT, CARD2);
         self.hook.ui(ctx);
     }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) { self.update.relaunch_if_needed(); }
 }
 
 // ---------------------------------------------------------------- tests

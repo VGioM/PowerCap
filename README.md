@@ -23,6 +23,7 @@ Moins de watts, c'est moins de chaleur dans le boîtier et moins de bruit, surto
 - **Appliquer et garder au démarrage** : crée un petit service systemd qui réapplique la limite **au démarrage et après chaque sortie de veille** (sinon le pilote revient à la valeur d'origine).
 - **Retirer le réglage permanent** : supprime le service et remet la carte à sa puissance d'origine.
 - Plusieurs cartes NVIDIA : un menu permet de choisir la carte, chacune a son propre réglage.
+- **Mises à jour intégrées** : au lancement (au plus une fois par jour), Watts regarde s'il existe une nouvelle version sur GitHub et propose de l'installer. L'AppImage est téléchargée, vérifiée (empreinte SHA-256) puis remplacée, et l'app se relance. Bouton « Rechercher les mises à jour » en bas de la fenêtre ; la recherche automatique peut être désactivée.
 
 ## Compatibilité
 
@@ -88,4 +89,10 @@ cargo run --release          # lancer
 
 `build-appimage.sh` a besoin de `mksquashfs` (squashfs-tools) et d'un runtime AppImage de type 2 (variable `APPIMAGE_RUNTIME`). Pour une AppImage compatible avec des systèmes plus anciens, compile dans un conteneur Fedora (distrobox) plutôt que sur un système très récent.
 
+Pour publier une nouvelle version : monter `version` dans `Cargo.toml` (1.0.1 → 1.0.2…), construire l'AppImage, puis créer une release GitHub `vX.Y.Z` qui contient `Watts-X.Y.Z-linux-x86_64.AppImage`. Les installations existantes la proposeront d'elles-mêmes.
+
 Interface : [egui](https://github.com/emilk/egui). Les actions administrateur passent par `pkexec` et des scripts shell qui valident leurs arguments (watts entiers, UUID de carte, nom du service).
+
+## Licence
+
+[MIT](LICENSE) : tout le monde peut reprendre, modifier et améliorer Watts, tant que la mention de copyright est conservée.

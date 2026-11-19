@@ -1,8 +1,8 @@
 [package]
-name = "watts"
-version = "1.0.1"
+name = "powercap"
+version = "1.0.2"
 edition = "2021"
-description = "Règle la limite de puissance d'une carte graphique NVIDIA sous Linux"
+description = "Limite de puissance des cartes NVIDIA et consommation du PC sous Linux"
 license = "MIT"
 publish = false
 

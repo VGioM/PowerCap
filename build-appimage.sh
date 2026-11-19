@@ -1,12 +1,12 @@
 #!/bin/bash
-# Construit dist/Watts-<version>-linux-x86_64.AppImage (à lancer dans la
+# Construit dist/PowerCap-<version>-linux-x86_64.AppImage (à lancer dans la
 # distrobox « rustbuild », Fedora 44, pour rester compatible avec les systèmes
 # plus anciens). Besoin : Rust, squashfs-tools ; runtime AppImage dans
 # APPIMAGE_RUNTIME (par défaut celui du cache electron-builder).
 set -euo pipefail
 cd "$(dirname "$0")"
 VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
-OUT="dist/Watts-$VERSION-linux-x86_64.AppImage"
+OUT="dist/PowerCap-$VERSION-linux-x86_64.AppImage"
 RUNTIME="${APPIMAGE_RUNTIME:-$(ls "$HOME"/.cache/electron-builder/appimage-*/appimage-*/runtime-x64 2>/dev/null | head -1)}"
 [ -f "$RUNTIME" ] || { echo "✗ Runtime AppImage introuvable : donnez son chemin dans APPIMAGE_RUNTIME."; exit 1; }
 command -v mksquashfs >/dev/null || { echo "✗ mksquashfs manquant (dnf install squashfs-tools)."; exit 1; }
@@ -17,11 +17,11 @@ cargo build --release --quiet
 echo "▸ AppImage…"
 APPDIR="$(mktemp -d)"; trap 'rm -rf "$APPDIR"' EXIT
 mkdir -p "$APPDIR/usr/bin" dist
-cp target/release/watts "$APPDIR/usr/bin/"
-cp resources/watts.desktop "$APPDIR/"
-cp resources/icon.png "$APPDIR/watts.png"
-ln -s watts.png "$APPDIR/.DirIcon"
-printf '#!/bin/sh\nHERE="$(dirname "$(readlink -f "$0")")"\nexec "$HERE/usr/bin/watts" "$@"\n' > "$APPDIR/AppRun"
+cp target/release/powercap "$APPDIR/usr/bin/"
+cp resources/powercap.desktop "$APPDIR/"
+cp resources/icon.png "$APPDIR/powercap.png"
+ln -s powercap.png "$APPDIR/.DirIcon"
+printf '#!/bin/sh\nHERE="$(dirname "$(readlink -f "$0")")"\nexec "$HERE/usr/bin/powercap" "$@"\n' > "$APPDIR/AppRun"
 chmod +x "$APPDIR/AppRun"
 rm -f "$OUT" "$OUT.squashfs"
 mksquashfs "$APPDIR" "$OUT.squashfs" -root-owned -noappend -comp gzip -quiet >/dev/null

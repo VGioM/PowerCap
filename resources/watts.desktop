@@ -1,9 +1,0 @@
-[Desktop Entry]
-Type=Application
-Name=Watts
-Comment=Limite de puissance de la carte graphique NVIDIA
-Exec=watts
-Icon=watts
-Categories=System;Settings;
-StartupWMClass=watts
-Terminal=false

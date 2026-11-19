@@ -1,8 +1,10 @@
-//! Watts : règle la limite de puissance (en watts) des cartes graphiques NVIDIA
-//! sous Linux. Le réglage s'applique tout de suite et, si on le demande, à
-//! chaque démarrage et après chaque mise en veille grâce à un petit service
-//! systemd par carte (/etc/systemd/system/watts-gpu-power-<id>.service). Les
-//! actions qui demandent les droits administrateur passent par pkexec.
+//! PowerCap : règle la limite de puissance (en watts) des cartes graphiques
+//! NVIDIA sous Linux, et montre en direct ce que consomment la carte, le
+//! processeur (estimation, avec ses limites PL1/PL2) et le PC complet. Le
+//! réglage de la carte s'applique tout de suite et, si on le demande, à chaque
+//! démarrage et après chaque mise en veille grâce à un petit service systemd
+//! par carte (/etc/systemd/system/powercap-gpu-<id>.service). Les actions qui
+//! demandent les droits administrateur passent par pkexec.
 
 use eframe::egui::{self, Color32, CornerRadius, Margin, RichText, Stroke};
 use std::collections::HashMap;
@@ -14,7 +16,9 @@ mod selfupdate;
 use selfupdate::SelfUpdate;
 
 const UNIT_DIR: &str = "/etc/systemd/system";
-const UNIT_PREFIX: &str = "watts-gpu-power";
+const UNIT_PREFIX: &str = "powercap-gpu";
+/// Préfixe des services créés par les versions 1.0.0 et 1.0.1 (alors appelées Watts).
+const LEGACY_PREFIX: &str = "watts-gpu-power";
 
 /// Écrit le service de la carte, l'active et applique la limite.
 /// `$1` = watts, `$2` = UUID de la carte, `$3` = nom du service.
@@ -22,19 +26,21 @@ const PERSIST_SCRIPT: &str = r#"set -e
 case "$1" in ''|*[!0-9]*) echo "valeur invalide" >&2; exit 2;; esac
 case "$2" in GPU-*) ;; *) echo "carte invalide" >&2; exit 2;; esac
 case "$2" in *[!A-Za-z0-9-]*) echo "carte invalide" >&2; exit 2;; esac
-case "$3" in watts-gpu-power-*.service) ;; *) echo "service invalide" >&2; exit 2;; esac
+case "$3" in powercap-gpu-*.service) ;; *) echo "service invalide" >&2; exit 2;; esac
 case "$3" in */*|*[!A-Za-z0-9.-]*) echo "service invalide" >&2; exit 2;; esac
 NVSMI="$(command -v nvidia-smi || echo /usr/bin/nvidia-smi)"
-# Ancien nom (Watts 1.0 avant la prise en charge de plusieurs cartes).
-if [ -e /etc/systemd/system/watts-gpu-power.service ]; then
-  systemctl disable watts-gpu-power.service >/dev/null 2>&1 || true
-  rm -f /etc/systemd/system/watts-gpu-power.service
-fi
+# Services des anciennes versions (l'app s'appelait alors Watts).
+for old in watts-gpu-power.service "watts-gpu-power-${3#powercap-gpu-}"; do
+  if [ -e "/etc/systemd/system/$old" ]; then
+    systemctl disable "$old" >/dev/null 2>&1 || true
+    rm -f "/etc/systemd/system/$old"
+  fi
+done
 cat > "/etc/systemd/system/$3" <<EOF
-# Créé par Watts (https://github.com/VGioM/Watts) : limite de puissance d'une
-# carte graphique NVIDIA, relancée au démarrage et après chaque mise en veille.
+# Créé par PowerCap (https://github.com/VGioM/PowerCap) : limite de puissance
+# d'une carte graphique NVIDIA, relancée au démarrage et après chaque veille.
 [Unit]
-Description=Limite de puissance NVIDIA $2 ($1 W, réglée avec Watts)
+Description=Limite de puissance NVIDIA $2 ($1 W, réglée avec PowerCap)
 After=nvidia-persistenced.service display-manager.service suspend.target hibernate.target hybrid-sleep.target suspend-then-hibernate.target
 
 [Service]
@@ -56,7 +62,7 @@ const REMOVE_SCRIPT: &str = r#"set -e
 case "$1" in ''|*[!0-9]*) echo "valeur invalide" >&2; exit 2;; esac
 case "$2" in GPU-*) ;; *) echo "carte invalide" >&2; exit 2;; esac
 case "$2" in *[!A-Za-z0-9-]*) echo "carte invalide" >&2; exit 2;; esac
-case "$3" in watts-gpu-power*.service) ;; *) echo "service invalide" >&2; exit 2;; esac
+case "$3" in powercap-gpu-*.service|watts-gpu-power*.service) ;; *) echo "service invalide" >&2; exit 2;; esac
 case "$3" in */*|*[!A-Za-z0-9.-]*) echo "service invalide" >&2; exit 2;; esac
 NVSMI="$(command -v nvidia-smi || echo /usr/bin/nvidia-smi)"
 systemctl disable "$3" >/dev/null 2>&1 || true
@@ -151,18 +157,125 @@ fn cpu_temp() -> Option<f32> {
     None
 }
 
+/// Limites de puissance du processeur lues dans /sys/class/powercap (RAPL),
+/// telles que le BIOS les a réglées : PL1 (continu), PL2 (pointes), durée des pointes.
+#[derive(Clone, Copy, Default, Debug, PartialEq)]
+struct CpuLimits { pl1: Option<f32>, pl2: Option<f32>, tau: Option<f32> }
+
+fn read_f(path: &std::path::Path) -> Option<f32> { std::fs::read_to_string(path).ok()?.trim().parse().ok() }
+
+fn cpu_limits() -> CpuLimits {
+    let base = std::path::Path::new("/sys/class/powercap/intel-rapl:0");
+    let mut l = CpuLimits::default();
+    for c in 0..3 {
+        let Ok(name) = std::fs::read_to_string(base.join(format!("constraint_{c}_name"))) else { continue };
+        let w = read_f(&base.join(format!("constraint_{c}_power_limit_uw"))).map(|u| u / 1e6).filter(|w| *w > 0.0);
+        match name.trim() {
+            "long_term" => { l.pl1 = w; l.tau = read_f(&base.join(format!("constraint_{c}_time_window_us"))).map(|u| u / 1e6).filter(|t| *t > 0.0); }
+            "short_term" => l.pl2 = w,
+            _ => {}
+        }
+    }
+    l
+}
+
+/// Nom du processeur (« 13th Gen Intel(R) Core(TM) i5-13400F » → « Intel Core i5-13400F »).
+fn cpu_name() -> String {
+    let info = std::fs::read_to_string("/proc/cpuinfo").unwrap_or_default();
+    let raw = info.lines().find_map(|l| l.strip_prefix("model name")).and_then(|l| l.split_once(':')).map(|(_, v)| v.trim().to_string()).unwrap_or_default();
+    let mut n = raw.replace("(R)", "").replace("(TM)", "").replace(" CPU", "");
+    if let Some(i) = n.find("Intel") { n = n[i..].to_string(); }
+    if let Some(i) = n.find(" with ") { n.truncate(i); }
+    n.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Temps CPU cumulés (actif, total) de /proc/stat.
+fn cpu_times() -> Option<(u64, u64)> {
+    let stat = std::fs::read_to_string("/proc/stat").ok()?;
+    let v: Vec<u64> = stat.lines().next()?.split_whitespace().skip(1).filter_map(|x| x.parse().ok()).collect();
+    if v.len() < 5 { return None; }
+    let total: u64 = v.iter().take(8).sum();
+    let idle = v[3] + v[4];
+    Some((total - idle, total))
+}
+
+/// Fréquence moyenne actuelle et fréquence maximale, en GHz.
+fn cpu_freqs() -> (f32, f32) {
+    let (mut sum, mut n, mut max) = (0.0, 0.0, 0.0f32);
+    if let Ok(dir) = std::fs::read_dir("/sys/devices/system/cpu") {
+        for e in dir.flatten() {
+            let name = e.file_name().to_string_lossy().to_string();
+            if !name.starts_with("cpu") || !name[3..].chars().all(|c| c.is_ascii_digit()) || name.len() == 3 { continue; }
+            if let Some(f) = read_f(&e.path().join("cpufreq/scaling_cur_freq")) { sum += f; n += 1.0; }
+            if let Some(f) = read_f(&e.path().join("cpufreq/cpuinfo_max_freq")) { max = max.max(f); }
+        }
+    }
+    (if n > 0.0 { sum / n / 1e6 } else { 0.0 }, max / 1e6)
+}
+
+/// Consommation estimée du processeur. Le compteur d'énergie exact (RAPL) n'est
+/// lisible qu'en administrateur : on estime à partir de la charge et de la
+/// fréquence, entre la consommation au repos et la pointe permise par PL2.
+fn cpu_power_estimate(util: f32, freq_ratio: f32, limits: &CpuLimits) -> f32 {
+    let pl1 = limits.pl1.unwrap_or(65.0);
+    // Certaines cartes mères mettent PL2 à « illimité » (4095 W) : on borne.
+    let peak = limits.pl2.unwrap_or(pl1 * 1.5).min(pl1 * 2.5).max(pl1);
+    let idle = (peak * 0.06).max(5.0);
+    let f = freq_ratio.clamp(0.2, 1.0);
+    (idle + (peak - idle) * util.clamp(0.0, 1.0) * f * f).min(peak)
+}
+
+/// Le reste du PC (carte mère, mémoire, SSD, ventilateurs, USB), en W, et le
+/// rendement typique d'une alimentation 80 Plus Gold à charge moyenne.
+const REST_W: f32 = 35.0;
+const PSU_EFFICIENCY: f32 = 0.90;
+
 #[derive(Clone, Copy, Default)]
 struct Peaks { temp: f32, draw: f32 }
 
+#[derive(Clone, Default)]
+struct Cpu { name: String, temp: Option<f32>, util: f32, freq: f32, max_freq: f32, limits: CpuLimits, watts: f32 }
+
 #[derive(Clone)]
-struct Live { gpus: Result<Vec<Gpu>, String>, cpu: Option<f32>, cpu_max: f32, peaks: HashMap<String, Peaks> }
+struct Live {
+    gpus: Result<Vec<Gpu>, String>,
+    cpu: Cpu,
+    cpu_max: f32,
+    cpu_w_max: f32,
+    total_max: f32,
+    peaks: HashMap<String, Peaks>,
+}
+
+impl Live {
+    /// Consommation du PC complet à la prise (hors écran), en W.
+    fn total(&self) -> f32 {
+        let gpus: f32 = self.gpus.as_ref().map(|l| l.iter().map(|g| g.draw).sum()).unwrap_or(0.0);
+        (gpus + self.cpu.watts + REST_W) / PSU_EFFICIENCY
+    }
+}
 
 fn spawn_monitor(ctx: egui::Context) -> Arc<Mutex<Live>> {
-    let live = Arc::new(Mutex::new(Live { gpus: Err("Lecture des cartes graphiques…".into()), cpu: None, cpu_max: 0.0, peaks: HashMap::new() }));
+    let live = Arc::new(Mutex::new(Live { gpus: Err("Lecture des cartes graphiques…".into()), cpu: Cpu { name: cpu_name(), ..Default::default() },
+        cpu_max: 0.0, cpu_w_max: 0.0, total_max: 0.0, peaks: HashMap::new() }));
     let shared = live.clone();
+    let mut prev = cpu_times();
+    // Secondes passées au-dessus de PL1 : au-delà de la durée de pointe, le processeur redescend à PL1.
+    let mut above_pl1 = 0.0f32;
     std::thread::spawn(move || loop {
         let gpus = query_gpus();
-        let cpu = cpu_temp();
+        let now = cpu_times();
+        let util = match (prev, now) {
+            (Some((a0, t0)), Some((a1, t1))) if t1 > t0 => (a1 - a0) as f32 / (t1 - t0) as f32,
+            _ => 0.0,
+        };
+        prev = now;
+        let (freq, max_freq) = cpu_freqs();
+        let limits = cpu_limits();
+        let mut watts = cpu_power_estimate(util, if max_freq > 0.0 { freq / max_freq } else { 1.0 }, &limits);
+        if let (Some(pl1), Some(tau)) = (limits.pl1, limits.tau) {
+            if watts > pl1 { above_pl1 += 1.0; if above_pl1 > tau { watts = pl1; } } else { above_pl1 = 0.0; }
+        }
+        let temp = cpu_temp();
         if let Ok(mut l) = shared.lock() {
             if let Ok(list) = &gpus {
                 for g in list {
@@ -171,9 +284,13 @@ fn spawn_monitor(ctx: egui::Context) -> Arc<Mutex<Live>> {
                     p.draw = p.draw.max(g.draw);
                 }
             }
-            if let Some(c) = cpu { l.cpu_max = l.cpu_max.max(c); }
+            if let Some(c) = temp { l.cpu_max = l.cpu_max.max(c); }
             l.gpus = gpus;
-            l.cpu = cpu;
+            let name = std::mem::take(&mut l.cpu.name);
+            l.cpu = Cpu { name, temp, util, freq, max_freq, limits, watts };
+            l.cpu_w_max = l.cpu_w_max.max(watts);
+            let total = l.total();
+            l.total_max = l.total_max.max(total);
         }
         ctx.request_repaint();
         std::thread::sleep(Duration::from_secs(1));
@@ -199,7 +316,7 @@ fn read_units() -> Vec<Unit> {
     let Ok(dir) = std::fs::read_dir(UNIT_DIR) else { return vec![] };
     let mut units: Vec<Unit> = dir.flatten().filter_map(|e| {
         let file = e.file_name().to_string_lossy().to_string();
-        if !file.starts_with(UNIT_PREFIX) || !file.ends_with(".service") { return None; }
+        if !(file.starts_with(UNIT_PREFIX) || file.starts_with(LEGACY_PREFIX)) || !file.ends_with(".service") { return None; }
         let (target, watts) = parse_unit(&std::fs::read_to_string(e.path()).ok()?)?;
         Some(Unit { file, target, watts, enabled: false })
     }).collect();
@@ -207,7 +324,8 @@ fn read_units() -> Vec<Unit> {
         u.enabled = Command::new("systemctl").args(["is-enabled", &u.file]).output()
             .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "enabled").unwrap_or(false);
     }
-    units.sort_by(|a, b| a.file.cmp(&b.file));
+    // Les services PowerCap d'abord, ceux de Watts ensuite.
+    units.sort_by_key(|u| (u.file.starts_with(LEGACY_PREFIX), u.file.clone()));
     units
 }
 
@@ -385,7 +503,7 @@ impl eframe::App for App {
         egui::CentralPanel::default().frame(egui::Frame::new().fill(BG).inner_margin(Margin::same(18))).show(ctx, |ui| {
             egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("Watts").size(28.0).strong());
+                    ui.label(RichText::new("PowerCap").size(28.0).strong());
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if gpus.len() > 1 {
                             let current = gpu.as_ref().map(|g| format!("{} · {}", g.index, g.name)).unwrap_or_default();
@@ -402,7 +520,7 @@ impl eframe::App for App {
                         }
                     });
                 });
-                ui.label(RichText::new("Limite de puissance de la carte graphique : moins de watts, moins de chaleur et de bruit.").color(MUTED));
+                ui.label(RichText::new("Limite de puissance de la carte graphique et consommation du PC : moins de watts, moins de chaleur et de bruit.").color(MUTED));
                 ui.add_space(10.0);
 
                 let Some(g) = gpu.clone() else {
@@ -414,32 +532,67 @@ impl eframe::App for App {
                 let peaks = live.peaks.get(&g.uuid).copied().unwrap_or_default();
 
                 // --- En direct
-                card(ui, "En direct", |ui| {
+                let cpu = &live.cpu;
+                card(ui, "Consommation en direct", |ui| {
                     ui.columns(3, |c| {
-                        tile(&mut c[0], "Consommation carte", format!("{:.0} W", g.draw), format!("limite {:.0} W · max vu {:.0} W", g.limit, peaks.draw), TEXT);
-                        tile(&mut c[1], "Température carte", format!("{:.0} °C", g.temp), format!("max vu {:.0} °C", peaks.temp), temp_color(g.temp, 75.0, 83.0));
-                        match live.cpu {
-                            Some(t) => tile(&mut c[2], "Température processeur", format!("{t:.0} °C"), format!("max vu {:.0} °C", live.cpu_max), temp_color(t, 85.0, 95.0)),
-                            None => tile(&mut c[2], "Température processeur", "—".into(), "capteur introuvable".into(), MUTED),
-                        }
+                        tile(&mut c[0], "Carte graphique", format!("{:.0} W", g.draw), format!("limite {:.0} W · max vu {:.0} W", g.limit, peaks.draw), TEXT);
+                        tile(&mut c[1], "Processeur (estimé)", format!("≈ {:.0} W", cpu.watts), format!("charge {:.0} % · max vu {:.0} W", cpu.util * 100.0, live.cpu_w_max), TEXT);
+                        tile(&mut c[2], "PC complet (estimé)", format!("≈ {:.0} W", live.total()), format!("à la prise · max vu {:.0} W", live.total_max), ACCENT);
                     });
-                    ui.add_space(4.0);
                     let frac = if g.limit > 0.0 { (g.draw / g.limit).clamp(0.0, 1.0) } else { 0.0 };
                     ui.add(egui::ProgressBar::new(frac).desired_height(10.0).fill(if frac > 0.95 { WARM } else { ACCENT }).corner_radius(CornerRadius::same(5)));
-                    small(ui, format!("Utilisation {:.0} %  ·  {:.0} MHz  ·  ventilateur {:.0} %", g.util, g.clock, g.fan));
-                    small(ui, "Les « max vu » comptent depuis l'ouverture de Watts : laisse-le ouvert pendant une partie pour voir les pics.");
+                    small(ui, format!("Carte mesurée par le pilote. Processeur estimé d'après sa charge et sa fréquence. PC complet : carte + processeur + ≈ {REST_W:.0} W pour le reste (carte mère, mémoire, SSD, ventilateurs), avec une alimentation à ≈ {:.0} % de rendement ; écran non compris.", PSU_EFFICIENCY * 100.0));
+                });
+                ui.add_space(10.0);
+                card(ui, "Températures", |ui| {
+                    ui.columns(3, |c| {
+                        tile(&mut c[0], "Carte graphique", format!("{:.0} °C", g.temp), format!("max vu {:.0} °C · ventilo {:.0} %", peaks.temp, g.fan), temp_color(g.temp, 75.0, 83.0));
+                        match cpu.temp {
+                            Some(t) => tile(&mut c[1], "Processeur", format!("{t:.0} °C"), format!("max vu {:.0} °C", live.cpu_max), temp_color(t, 85.0, 95.0)),
+                            None => tile(&mut c[1], "Processeur", "—".into(), "capteur introuvable".into(), MUTED),
+                        }
+                        tile(&mut c[2], "Fréquences", format!("{:.1} GHz", cpu.freq), format!("processeur, max {:.1} GHz", cpu.max_freq), TEXT);
+                    });
+                    small(ui, "Les « max vu » comptent depuis l'ouverture de PowerCap : laisse-le ouvert pendant une partie pour voir les pics.");
+                });
+                ui.add_space(10.0);
+
+                // --- Processeur
+                card(ui, "Limites du processeur", |ui| {
+                    if !cpu.name.is_empty() { ui.label(RichText::new(&cpu.name).strong()); }
+                    let l = cpu.limits;
+                    if l.pl1.is_none() && l.pl2.is_none() {
+                        small(ui, "Limites non lisibles sur ce processeur (sur AMD, elles s'appellent PPT et se règlent dans le BIOS, souvent via « Eco Mode »).");
+                    } else {
+                        let w = |v: Option<f32>| v.map(|v| if v >= 1000.0 { "illimité".to_string() } else { format!("{v:.0} W") }).unwrap_or_else(|| "—".into());
+                        ui.columns(3, |c| {
+                            tile(&mut c[0], "PL1 · en continu", w(l.pl1), "puissance tenue sans limite de temps".into(), TEXT);
+                            tile(&mut c[1], "PL2 · pointes", w(l.pl2), "puissance des accélérations".into(), TEXT);
+                            tile(&mut c[2], "Durée des pointes", l.tau.map(|t| format!("{t:.0} s")).unwrap_or_else(|| "—".into()), "avant de redescendre à PL1".into(), TEXT);
+                        });
+                        if let Some(pl1) = l.pl1 {
+                            let advice = (pl1 * 1.4 / 5.0).round() * 5.0;
+                            let hot = l.pl2.map(|p| p > advice + 2.0).unwrap_or(false);
+                            ui.label(RichText::new(if hot {
+                                format!("Pour un PC plus frais : PL2 ≈ {advice:.0} W (1,4 × PL1) coupe les pics de chaleur sans presque rien changer en jeu.")
+                            } else {
+                                "Réglage déjà raisonnable pour garder le PC au frais.".to_string()
+                            }).color(if hot { WARM } else { ACCENT }));
+                        }
+                        small(ui, "Lecture seule : ces limites se règlent dans le BIOS (Intel : « Package Power Limit », chez ASUS : Ai Tweaker, puis Internal CPU Power Management). Pense à désactiver « MultiCore Enhancement » pour qu'elles soient respectées.");
+                    }
                 });
                 ui.add_space(10.0);
 
                 // --- Réglage
                 if !g.adjustable() {
-                    card(ui, "Nouvelle limite", |ui| {
+                    card(ui, "Limite de la carte graphique", |ui| {
                         ui.label(RichText::new("Cette carte ne permet pas de régler sa limite de puissance.").strong().color(WARM));
                         small(ui, "C'est le cas de la plupart des cartes de PC portables et de certaines cartes anciennes : le pilote NVIDIA bloque le réglage. Les mesures en direct restent disponibles.");
                     });
                 } else {
                     let mut target = self.target.unwrap_or(g.limit);
-                    card(ui, "Nouvelle limite", |ui| {
+                    card(ui, "Limite de la carte graphique", |ui| {
                         let ratio = target / g.default;
                         ui.horizontal(|ui| {
                             ui.label(RichText::new(format!("{target:.0} W")).size(36.0).strong().color(ACCENT));
@@ -541,7 +694,7 @@ impl eframe::App for App {
                 }
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
-                    small(ui, format!("Watts {}", env!("CARGO_PKG_VERSION")));
+                    small(ui, format!("PowerCap {}", env!("CARGO_PKG_VERSION")));
                     let label = if self.update.busy() { "Recherche…" } else { "Rechercher les mises à jour" };
                     if ui.add_enabled(!self.update.busy(), egui::Button::new(RichText::new(label).size(12.5)).small()).clicked() {
                         self.update.check_now(ui.ctx());
@@ -606,7 +759,7 @@ mod tests {
         assert_eq!(g.name, "NVIDIA GeForce RTX 4070");
         assert_eq!((g.limit, g.default, g.min, g.max), (200.0, 200.0, 100.0, 216.0));
         assert!(g.adjustable());
-        assert_eq!(g.unit(), "watts-gpu-power-ebab68d5.service");
+        assert_eq!(g.unit(), "powercap-gpu-ebab68d5.service");
         // Carte de portable : limites non disponibles.
         let g = parse_gpu("1, GPU-1234, NVIDIA GeForce RTX 4060 Laptop GPU, [N/A], [N/A], [N/A], [N/A], [N/A], 40, [N/A], 0, 0").unwrap();
         assert_eq!((g.index, g.draw), (1, 0.0));
@@ -641,6 +794,18 @@ mod tests {
     }
 
     #[test]
+    fn cpu_estimate() {
+        let l = CpuLimits { pl1: Some(65.0), pl2: Some(148.0), tau: Some(28.0) };
+        assert!(cpu_power_estimate(0.0, 0.2, &l) < 12.0);
+        let game = cpu_power_estimate(0.35, 1.0, &l);
+        assert!(game > 40.0 && game < 70.0, "{game}");
+        assert!(cpu_power_estimate(1.0, 1.0, &l) <= 148.0);
+        // PL2 « illimité » : bornée à 2,5 × PL1.
+        let unl = CpuLimits { pl1: Some(125.0), pl2: Some(4095.0), tau: None };
+        assert!(cpu_power_estimate(1.0, 1.0, &unl) <= 312.5);
+    }
+
+    #[test]
     fn scripts_are_valid_shell() {
         for s in [PERSIST_SCRIPT, REMOVE_SCRIPT] {
             let ok = Command::new("sh").args(["-n", "-c", s]).status().map(|s| s.success()).unwrap_or(true);
@@ -656,8 +821,8 @@ fn main() -> eframe::Result {
         egui::IconData { rgba: i.into_raw(), width: w, height: h }
     });
     let mut viewport = egui::ViewportBuilder::default()
-        .with_title("Watts").with_app_id("watts").with_inner_size([640.0, 900.0]).with_min_inner_size([560.0, 600.0]);
+        .with_title("PowerCap").with_app_id("powercap").with_inner_size([640.0, if std::env::var_os("APP_SCREENSHOT").is_some() { 1400.0 } else { 900.0 }]).with_min_inner_size([560.0, 600.0]);
     if let Some(i) = icon { viewport = viewport.with_icon(i); }
     let options = eframe::NativeOptions { viewport, renderer: eframe::Renderer::Glow, vsync: true, ..Default::default() };
-    eframe::run_native("Watts", options, Box::new(|cc| Ok(Box::new(App::new(cc)))))
+    eframe::run_native("PowerCap", options, Box::new(|cc| Ok(Box::new(App::new(cc)))))
 }

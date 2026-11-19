@@ -1,9 +1,9 @@
-//! Mise à jour depuis les releases GitHub de VGioM/Watts (même principe que
+//! Mise à jour depuis les releases GitHub de VGioM/PowerCap (même principe que
 //! Biblifilm, Biblijeu et Recomps).
 //!
 //! Au lancement (au plus une fois toutes les 20 h, sauf si la recherche
 //! automatique est désactivée), l'app lit les releases du dépôt et prend la
-//! plus récente qui contient `Watts-<version>-linux-x86_64.AppImage`. Si elle
+//! plus récente qui contient `PowerCap-<version>-linux-x86_64.AppImage`. Si elle
 //! est plus récente, l'app propose de l'installer : l'AppImage est téléchargée
 //! à côté de celle en place, vérifiée (empreinte SHA-256 publiée par GitHub,
 //! en-tête ELF, taille), rendue exécutable, puis échangée avec l'ancienne par
@@ -17,15 +17,23 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 
-const REPO: &str = "VGioM/Watts";
-const APP: &str = "Watts";
+const REPO: &str = "VGioM/PowerCap";
+const APP: &str = "PowerCap";
 
 // ---------------------------------------------------------------- préférences
 
 fn prefs_path() -> Option<PathBuf> {
     let base = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
-    Some(base.join("Watts").join("update.json"))
+    let path = base.join("PowerCap").join("update.json");
+    // Préférences de l'époque où l'app s'appelait Watts.
+    let old = base.join("Watts").join("update.json");
+    if !path.exists() && old.exists() {
+        if let Some(d) = path.parent() { let _ = std::fs::create_dir_all(d); }
+        let _ = std::fs::rename(&old, &path);
+        let _ = std::fs::remove_dir(base.join("Watts"));
+    }
+    Some(path)
 }
 
 #[derive(Default)]
@@ -106,7 +114,7 @@ fn pick(releases: &[GhRelease]) -> Option<(usize, usize)> {
 fn agent() -> ureq::Agent {
     ureq::Agent::config_builder()
         .timeout_global(Some(std::time::Duration::from_secs(30)))
-        .user_agent(concat!("Watts-updater/", env!("CARGO_PKG_VERSION")))
+        .user_agent(concat!("PowerCap-updater/", env!("CARGO_PKG_VERSION")))
         .build().into()
 }
 
@@ -376,9 +384,9 @@ mod tests {
             assets: files.iter().map(|n| GhAsset { name: n.to_string(), browser_download_url: String::new(), size: 0, digest: None }).collect() };
         let list = vec![
             rel("v1.0.3", &["notes.txt"], false),
-            rel("v1.0.4", &["Watts-1.0.4-linux-x86_64.AppImage"], true),
-            rel("v1.0.2", &["Watts-1.0.2-linux-x86_64.AppImage"], false),
-            rel("v1.0.1", &["Watts-1.0.1-linux-x86_64.AppImage"], false),
+            rel("v1.0.4", &["PowerCap-1.0.4-linux-x86_64.AppImage"], true),
+            rel("v1.0.2", &["PowerCap-1.0.2-linux-x86_64.AppImage"], false),
+            rel("v1.0.1", &["PowerCap-1.0.1-linux-x86_64.AppImage"], false),
         ];
         assert_eq!(pick(&list), Some((2, 0)));
         assert_eq!(pick(&list[..1]), None);

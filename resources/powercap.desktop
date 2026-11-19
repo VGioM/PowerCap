@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=PowerCap
+Comment=Limite de puissance de la carte graphique NVIDIA et consommation du PC
+Exec=powercap
+Icon=powercap
+Categories=System;Settings;
+StartupWMClass=powercap
+Terminal=false

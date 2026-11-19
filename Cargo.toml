@@ -1,6 +1,6 @@
 [package]
 name = "powercap"
-version = "1.0.2"
+version = "1.0.3"
 edition = "2021"
 description = "Limite de puissance des cartes NVIDIA et consommation du PC sous Linux"
 license = "MIT"

@@ -217,9 +217,11 @@ fn cpu_freqs() -> (f32, f32) {
 /// lisible qu'en administrateur : on estime à partir de la charge et de la
 /// fréquence, entre la consommation au repos et la pointe permise par PL2.
 fn cpu_power_estimate(util: f32, freq_ratio: f32, limits: &CpuLimits) -> f32 {
-    let pl1 = limits.pl1.unwrap_or(65.0);
-    // Certaines cartes mères mettent PL2 à « illimité » (4095 W) : on borne.
-    let peak = limits.pl2.unwrap_or(pl1 * 1.5).min(pl1 * 2.5).max(pl1);
+    // Certaines cartes mères mettent PL1/PL2 à « illimité » (4095 W) : on borne.
+    let pl1 = limits.pl1.unwrap_or(65.0).min(320.0);
+    let pl2 = limits.pl2.unwrap_or(pl1 * 1.5).min(320.0);
+    // La pointe, c'est PL2 ; si PL2 est sous PL1, c'est lui qui limite tout le temps.
+    let peak = pl2.min(pl1 * 2.5).max(5.0);
     let idle = (peak * 0.06).max(5.0);
     let f = freq_ratio.clamp(0.2, 1.0);
     (idle + (peak - idle) * util.clamp(0.0, 1.0) * f * f).min(peak)
@@ -272,7 +274,7 @@ fn spawn_monitor(ctx: egui::Context) -> Arc<Mutex<Live>> {
         let (freq, max_freq) = cpu_freqs();
         let limits = cpu_limits();
         let mut watts = cpu_power_estimate(util, if max_freq > 0.0 { freq / max_freq } else { 1.0 }, &limits);
-        if let (Some(pl1), Some(tau)) = (limits.pl1, limits.tau) {
+        if let (Some(pl1), Some(tau)) = (limits.pl1.filter(|p| limits.pl2.map_or(true, |p2| *p <= p2)), limits.tau) {
             if watts > pl1 { above_pl1 += 1.0; if above_pl1 > tau { watts = pl1; } } else { above_pl1 = 0.0; }
         }
         let temp = cpu_temp();
@@ -570,7 +572,10 @@ impl eframe::App for App {
                             tile(&mut c[1], "PL2 · pointes", w(l.pl2), "puissance des accélérations".into(), TEXT);
                             tile(&mut c[2], "Durée des pointes", l.tau.map(|t| format!("{t:.0} s")).unwrap_or_else(|| "—".into()), "avant de redescendre à PL1".into(), TEXT);
                         });
-                        if let Some(pl1) = l.pl1 {
+                        if let Some((pl1, pl2)) = l.pl1.zip(l.pl2).filter(|(a, b)| b + 1.0 < *a) {
+                            let pl1_advice = ((pl2 / 1.4 / 5.0).round() * 5.0).max(35.0);
+                            ui.label(RichText::new(format!("PL2 ({pl2:.0} W) est plus bas que PL1 ({}) : le processeur est donc limité à {pl2:.0} W en permanence, sans pointes. Pour avoir « {pl1_advice:.0} W en continu, pointes à {pl2:.0} W », règle PL1 (Long Duration) à {pl1_advice:.0} W dans le BIOS.", if pl1 >= 1000.0 { "illimité".to_string() } else { format!("{pl1:.0} W") })).color(WARM));
+                        } else if let Some(pl1) = l.pl1.filter(|p| *p < 1000.0) {
                             let advice = (pl1 * 1.4 / 5.0).round() * 5.0;
                             let hot = l.pl2.map(|p| p > advice + 2.0).unwrap_or(false);
                             ui.label(RichText::new(if hot {
@@ -803,6 +808,9 @@ mod tests {
         // PL2 « illimité » : bornée à 2,5 × PL1.
         let unl = CpuLimits { pl1: Some(125.0), pl2: Some(4095.0), tau: None };
         assert!(cpu_power_estimate(1.0, 1.0, &unl) <= 312.5);
+        // Profil ASUS : PL1 253 W, PL2 90 W → jamais plus de 90 W.
+        let asus = CpuLimits { pl1: Some(253.0), pl2: Some(90.0), tau: Some(16.0) };
+        assert!(cpu_power_estimate(1.0, 1.0, &asus) <= 90.0);
     }
 
     #[test]

@@ -1,0 +1,19 @@
+[package]
+name = "watts"
+version = "1.0.0"
+edition = "2021"
+description = "Règle la limite de puissance d'une carte graphique NVIDIA sous Linux"
+license = "UNLICENSED"
+publish = false
+
+[dependencies]
+eframe = { version = "=0.31.1", default-features = false, features = ["glow", "wayland", "x11", "default_fonts"] }
+egui = "=0.31.1"
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 4
+strip = true
+panic = "abort"

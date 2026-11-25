@@ -718,6 +718,34 @@ fn risk(v: i32, steps: [i32; 3]) -> Risk {
     if v <= 0 { Risk::Origin } else if v <= steps[0] { Risk::Safe } else if v <= steps[1] { Risk::Typical } else if v <= steps[2] { Risk::High } else { Risk::Unstable }
 }
 
+/// Overclockings conseillés (prudent, courant, élevé) pour une limite de
+/// `ratio` × l'origine. Le processeur graphique garde les mêmes paliers : sa
+/// stabilité se joue en haut de sa courbe, atteinte dans les menus et les jeux
+/// légers quelle que soit la limite. La mémoire vidéo, elle, prend ses watts
+/// au processeur graphique : plus la limite est basse, moins elle doit monter.
+fn oc_plan(s: &OcSteps, ratio: f32) -> [(i32, i32); 3] {
+    let mem = useful_mem(s, ratio);
+    [0, 1, 2].map(|i| (s.core[i], s.mem[i].min([mem / 2, mem * 3 / 4, mem][i] / 250 * 250)))
+}
+
+/// Au-delà de ce décalage mémoire, le gain d'images/s est nul à cette limite.
+fn useful_mem(s: &OcSteps, ratio: f32) -> i32 {
+    if ratio < 0.7 { 1500 } else if ratio < 0.9 { 2250 } else { s.mem[2] }
+}
+
+/// Gain d'images/s estimé (en %) d'un overclocking à pleine charge. Avec une
+/// limite basse, le décalage agit comme un sous-voltage : mêmes watts, plus de
+/// MHz, donc il rapporte plus qu'à la puissance d'origine.
+fn oc_gain(s: &OcSteps, core: i32, mem: i32, ratio: f32) -> f32 {
+    let t = ((ratio - 0.7) / 0.3).clamp(0.0, 1.0);
+    let per_100 = 3.5 + (2.0 - 3.5) * t;
+    let per_100 = if s.core[0] > 100 { per_100 * 0.8 } else { per_100 };
+    let core = core.clamp(0, s.core[2]) as f32 / 100.0 * per_100;
+    let mem_per_1000 = if ratio < 0.9 { 0.7 } else { 1.5 };
+    let mem = mem.clamp(0, useful_mem(s, ratio).min(s.mem[2])) as f32 / 1000.0 * mem_per_1000;
+    core + mem
+}
+
 /// Le curseur va un peu au-delà du palier « élevé » (zone rouge), sans dépasser ce que le pilote permet.
 fn oc_caps(s: &OcSteps, o: &nvml::Offsets) -> (i32, i32) {
     ((s.core[2] + 100).min(o.core_range.1).max(0), (s.mem[2] + 500).min(o.mem_range.1).max(0))
@@ -1102,10 +1130,15 @@ impl eframe::App for App {
                     }
 
                     let steps = oc_steps(&g.name);
+                    // Les conseils suivent le curseur de watts, même pas encore appliqué.
+                    let watts = if g.adjustable() { self.target.unwrap_or(g.limit) } else { g.limit };
+                    let ratio = if g.default > 0.0 { watts / g.default } else { 1.0 };
+                    let plan = oc_plan(&steps, ratio);
+                    let pending_w = (watts - g.limit).abs() >= 0.5;
                     let (core_cap, mem_cap) = oc_caps(&steps, &now);
                     let (mut core, mut mem) = self.oc_target.unwrap_or_else(|| oc_unit.as_ref().map(|u| (u.core, u.mem)).unwrap_or((now.core, now.mem)));
                     // Carte bridée en watts : l'overclocking ne chauffe pas plus, il récupère des images/s.
-                    let limited = g.adjustable() && g.limit < g.default * 0.97;
+                    let limited = g.adjustable() && watts < g.default * 0.97;
                     egui::CollapsingHeader::new(RichText::new("Afficher les réglages").strong()).id_salt(("oc", &g.uuid)).default_open(active).show(ui, |ui| {
                         let boxed = |ui: &mut egui::Ui, add: &mut dyn FnMut(&mut egui::Ui)| {
                             egui::Frame::new().fill(CARD2).corner_radius(CornerRadius::same(10)).inner_margin(Margin::same(12)).show(ui, |ui| {
@@ -1117,12 +1150,15 @@ impl eframe::App for App {
                             ui.label(RichText::new("À quoi ça sert ?").strong());
                             small(ui, "La carte fait tourner ses puces un peu plus vite que prévu à l'usine : quelques images/s en plus, gratuitement.");
                             if limited {
-                                ui.label(RichText::new(format!("Ta carte est limitée à {:.0} W ({:.0} % de l'origine) : l'overclocking ne la fera pas chauffer plus, elle reste plafonnée à {:.0} W. Elle tire simplement plus d'images/s de ces mêmes watts, et rattrape une partie de ce que la limite fait perdre.", g.limit, g.limit / g.default * 100.0, g.limit)).color(ACCENT));
+                                ui.label(RichText::new(format!("Ta carte est limitée à {:.0} W ({:.0} % de l'origine) : l'overclocking ne la fera pas chauffer plus, elle reste plafonnée à {:.0} W. Elle tire simplement plus d'images/s de ces mêmes watts, et rattrape une partie de ce que la limite fait perdre.", watts, ratio * 100.0, watts)).color(ACCENT));
                             } else {
-                                ui.label(RichText::new(format!("Ta carte est à sa puissance d'origine ({:.0} W) : elle gagne quelques images/s et chauffe un peu plus, sans jamais dépasser {:.0} W.", g.limit, g.limit)).color(TEXT));
+                                ui.label(RichText::new(format!("Ta carte est à {:.0} W ({:.0} % de l'origine) : elle gagne quelques images/s et chauffe un peu plus, sans jamais dépasser {:.0} W.", watts, ratio * 100.0, watts)).color(TEXT));
                                 if g.adjustable() {
                                     small(ui, format!("Astuce : limite « Équilibré » ({:.0} W) + overclocking « Prudent » = presque toutes les performances, avec moins de chaleur et de bruit.", preset_watts(&g, 0.8)));
                                 }
+                            }
+                            if pending_w {
+                                small(ui, format!("Conseils calculés pour {watts:.0} W, la valeur du curseur de limite ci-dessus (pas encore appliquée)."));
                             }
                             ui.add_space(4.0);
                             ui.label(RichText::new("Sans danger pour la carte").strong());
@@ -1157,13 +1193,14 @@ impl eframe::App for App {
                         };
                         slider(ui, "Processeur graphique", "Le cœur de la carte : c'est lui qui donne le plus d'images/s.", &mut core, core_cap, 5.0, steps.core);
                         ui.add_space(4.0);
-                        let mem_hint = if limited { "Gain plus faible. Avec une limite de watts réduite, elle prend des watts au processeur graphique : reste vers +500 à +1000." } else { "Gain plus faible, surtout utile en haute résolution." };
-                        slider(ui, "Mémoire vidéo", mem_hint, &mut mem, mem_cap, 50.0, steps.mem);
+                        let mem_hint = if limited { format!("Gain plus faible. Avec une limite de watts réduite, elle prend des watts au processeur graphique : à {watts:.0} W, inutile de dépasser +{}.", useful_mem(&steps, ratio).min(steps.mem[2])) } else { "Gain plus faible, surtout utile en haute résolution.".to_string() };
+                        slider(ui, "Mémoire vidéo", &mem_hint, &mut mem, mem_cap, 50.0, steps.mem);
                         ui.add_space(4.0);
-                        let presets = [("D'origine", "aucun", 0usize), ("Prudent", "conseillé", 1), ("Courant", "à tester", 2)];
+                        ui.label(RichText::new(format!("Conseillé pour {watts:.0} W")).strong());
+                        let presets = [("D'origine", "aucun", 0usize), ("Prudent", "conseillé", 1), ("Courant", "à tester", 2), ("Élevé", "risqué", 3)];
                         ui.columns(presets.len(), |c| {
                             for (i, (name, hint, lvl)) in presets.iter().enumerate() {
-                                let (pc, pm) = if *lvl == 0 { (0, 0) } else { (steps.core[lvl - 1], steps.mem[lvl - 1]) };
+                                let (pc, pm) = if *lvl == 0 { (0, 0) } else { plan[lvl - 1] };
                                 let sel = core == pc && mem == pm;
                                 let text = RichText::new(format!("{name}\n+{pc} / +{pm}\n{hint}")).size(13.0).color(if sel { ACCENT } else { TEXT });
                                 let b = egui::Button::new(text).min_size(egui::vec2(c[i].available_width(), 62.0))
@@ -1177,16 +1214,26 @@ impl eframe::App for App {
                         boxed(ui, &mut |ui| {
                             let (line, color) = match worst {
                                 Risk::Origin => ("Fréquences d'origine : rien à tester.", TEXT),
-                                Risk::Safe => ("Prudent : la quasi-totalité des cartes le tiennent. Gain ≈ +2 à 4 % d'images/s.", ACCENT),
-                                Risk::Typical => ("Courant : beaucoup de cartes le tiennent, mais chacune est différente. Teste bien avant de le garder. Gain ≈ +4 à 6 %.", ACCENT),
+                                Risk::Safe => ("Prudent : la quasi-totalité des cartes le tiennent.", ACCENT),
+                                Risk::Typical => ("Courant : beaucoup de cartes le tiennent, mais chacune est différente. Teste bien avant de le garder.", ACCENT),
                                 Risk::High => ("Élevé : beaucoup de cartes plantent ici (jeu qui se ferme, écran noir, petits carrés colorés). Sans danger pour la carte, mais à tester longuement.", WARM),
                                 Risk::Unstable => ("Trop haut : le jeu ou le PC va presque sûrement planter. Ça n'abîme pas la carte, mais ce réglage ne peut pas être gardé au démarrage.", HOT),
                             };
                             ui.label(RichText::new(line).strong().color(color));
+                            if worst != Risk::Origin && worst != Risk::Unstable {
+                                let gain = oc_gain(&steps, core, mem, ratio);
+                                if ratio < 0.995 {
+                                    let loss = fps_loss(ratio);
+                                    let net = ((1.0 - loss / 100.0) * (1.0 + gain / 100.0) - 1.0) * 100.0;
+                                    ui.label(RichText::new(format!("À {watts:.0} W, carte à fond : ≈ −{loss:.0} % d'images/s sans overclocking, ≈ {}{:.0} % avec (gain ≈ +{gain:.0} %), sans chaleur en plus.", if net < -0.5 { "−" } else { "+" }, net.abs())).color(TEXT));
+                                } else {
+                                    ui.label(RichText::new(format!("Gain ≈ +{gain:.0} % d'images/s à pleine charge, pour un peu plus de chaleur (toujours sous {watts:.0} W).")).color(TEXT));
+                                }
+                            }
                             if rm >= Risk::High {
                                 small(ui, "Mémoire vidéo trop poussée : elle corrige ses erreurs en silence et les images/s baissent au lieu de monter.");
-                            } else if limited && mem > steps.mem[0] {
-                                small(ui, format!("Avec la limite à {:.0} W, au-delà de +{} sur la mémoire vidéo le gain est souvent nul : mieux vaut monter le processeur graphique.", g.limit, steps.mem[0]));
+                            } else if limited && mem > useful_mem(&steps, ratio) {
+                                small(ui, format!("Avec la limite à {watts:.0} W, au-delà de +{} sur la mémoire vidéo le gain est nul : mieux vaut monter le processeur graphique.", useful_mem(&steps, ratio)));
                             }
                         });
                         ui.add_space(8.0);
@@ -1424,6 +1471,13 @@ mod tests {
         assert_eq!(oc_caps(&s, &o), (400, 3500));
         let tight = nvml::Offsets { core_range: (0, 250), mem_range: (0, 1500), ..Default::default() };
         assert_eq!(oc_caps(&s, &tight), (250, 1500));
+        // Conseils selon les watts : la mémoire baisse avec la limite, le cœur reste.
+        assert_eq!(oc_plan(&s, 1.0), [(100, 1000), (200, 2000), (300, 3000)]);
+        assert_eq!(oc_plan(&s, 0.6), [(100, 750), (200, 1000), (300, 1500)]);
+        assert_eq!(oc_plan(&s, 0.8), [(100, 1000), (200, 1500), (300, 2250)]);
+        // Un overclocking rapporte plus à 120 W qu'à 200 W, et la mémoire inutile ne compte pas.
+        assert!(oc_gain(&s, 100, 750, 0.6) > oc_gain(&s, 100, 750, 1.0));
+        assert_eq!(oc_gain(&s, 0, 3000, 0.6), oc_gain(&s, 0, 1500, 0.6));
     }
 
     #[test]

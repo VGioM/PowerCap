@@ -12,10 +12,18 @@ Moins de watts, c'est moins de chaleur dans le boîtier et moins de bruit, surto
 - **Carte graphique** : consommation mesurée par le pilote NVIDIA.
 - **Processeur (estimé)** : calculé d'après sa charge et sa fréquence, et plafonné par ses limites PL1/PL2. Le compteur d'énergie exact du processeur n'est lisible qu'en administrateur, d'où l'estimation.
 - **PC complet (estimé)** : carte + processeur + mémoire + environ 30 W pour le reste (carte mère, SSD, ventilateurs), avec une alimentation à environ 90 % de rendement. C'est ce que le PC tire **à la prise**, écran non compris.
+- **PC seul, écran, PC + écran** : les trois chiffres côte à côte quand un écran est détecté.
 - **Mémoire vive (estimée)** : les barrettes n'ont pas de capteur de watts. L'estimation part de leur nombre, de leur type, de leur tension (1,35 V avec XMP) et de l'activité du PC : en général 3 à 12 W pour deux barrettes DDR5.
 - **Températures** : carte graphique, processeur, mémoire vive (barrettes DDR5 et certaines DDR4), SSD NVMe, carte mère (chipset), et vitesse des ventilateurs. Seuls les capteurs présents sont affichés ; orange = chaud, rouge = très chaud. Les disques durs SATA ne sont pas lus, pour ne pas les réveiller.
 - **Fréquences et charge** : processeur, carte graphique, et mémoire vidéo occupée.
 - Pour chaque mesure, le **maximum vu** depuis l'ouverture de l'app : laisse PowerCap ouvert pendant une partie pour voir les pics.
+
+### Écran (estimé)
+- **Modèle et taille** lus dans l'écran (EDID), **fréquence, définition, VRR et HDR** lus chez KDE (ou xrandr).
+- **Consommation à chaque fréquence** possible (par ex. 60 / 120 / 180 Hz). La fréquence pèse peu sur l'écran lui-même ; c'est la carte graphique qui travaille plus à haute fréquence.
+- **OLED** : la consommation dépend surtout de la clarté de l'image. Réglage Auto (jeu détecté, ou thème clair/sombre du bureau), Sombre, Jeu/film ou Clair. **LCD** : elle dépend surtout de la luminosité.
+- **Luminosité** lue par DDC/CI quand l'écran donne une valeur juste, sinon à recopier depuis le menu de l'écran (retenue dans `~/.config/PowerCap/ecrans.json`).
+- Écrans connus calés sur la fiche du fabricant (Samsung Odyssey OLED G5 G50SF : 28 W type, 78 W max) ; les autres d'après leur taille et leur technologie.
 
 ### Mémoire vive
 - **Occupation** : mémoire utilisée sur la mémoire totale, et nombre et type des barrettes (par ex. 2 × 16 Go DDR5).
@@ -48,7 +56,7 @@ Tout est lu sans mot de passe : la table DMI du BIOS (rendue lisible par udev) e
 - Avec plusieurs cartes NVIDIA, un menu permet de choisir la carte. Chacune a son propre réglage.
 
 ### Overclocking de la carte (facultatif)
-- Deux curseurs : **+MHz sur le processeur graphique** et **+MHz sur la mémoire vidéo**, avec 3 réglages tout prêts (D'origine, Prudent, Courant).
+- Deux curseurs : **+MHz sur le processeur graphique** et **+MHz sur la mémoire vidéo**, avec 4 réglages tout prêts (D'origine, Prudent, Courant, Élevé) **calculés pour la limite de watts choisie** : la mémoire vidéo monte moins quand la limite est basse, et l'app estime le gain d'images/s.
 - **Avertissements par paliers**, en couleur : prudent, courant, élevé (beaucoup de cartes plantent), trop haut (presque sûrement instable). Les curseurs s'arrêtent un peu au-delà du palier élevé, et un réglage « trop haut » ne peut pas être gardé au démarrage.
 
   | Palier | Processeur graphique (RTX 30/40) | RTX 50 | Mémoire vidéo |

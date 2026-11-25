@@ -6,6 +6,8 @@
 //! réglages s'appliquent tout de suite et, si on le demande, à chaque démarrage
 //! et après chaque mise en veille grâce à de petits services systemd par carte
 //! (/etc/systemd/system/powercap-gpu-<id>.service, powercap-oc-<id>.service).
+//! Il estime aussi ce que consomment les écrans (modèle, fréquence, HDR,
+//! luminosité et, pour un OLED, clarté de l'image).
 //! Les actions qui demandent les droits administrateur passent par pkexec.
 
 use eframe::egui::{self, Color32, CornerRadius, Margin, RichText, Stroke};
@@ -14,6 +16,7 @@ use std::process::Command;
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
+mod display;
 mod nvml;
 mod selfupdate;
 use selfupdate::SelfUpdate;
@@ -507,6 +510,10 @@ struct Live {
     ram_w: f32,
     ram_w_max: f32,
     board: Board,
+    monitors: Vec<display::Monitor>,
+    /// Luminosité lue par DDC/CI, par connecteur (lue une fois, c'est lent).
+    ddc: Vec<(String, f32)>,
+    dark_desktop: Option<bool>,
 }
 
 impl Live {
@@ -520,8 +527,16 @@ impl Live {
 fn spawn_monitor(ctx: egui::Context) -> Arc<Mutex<Live>> {
     let live = Arc::new(Mutex::new(Live { gpus: Err("Lecture des cartes graphiques…".into()), cpu: Cpu { name: cpu_name(), ..Default::default() },
         cpu_max: 0.0, cpu_w_max: 0.0, total_max: 0.0, peaks: HashMap::new(), ram: ram_kit(), ram_used: ram_usage(), ram_temp: None, ram_temp_max: 0.0,
-        ram_w: 0.0, ram_w_max: 0.0, board: Board::default() }));
+        ram_w: 0.0, ram_w_max: 0.0, board: Board::default(), monitors: display::monitors(), ddc: Vec::new(), dark_desktop: display::dark_desktop() }));
     let shared = live.clone();
+    {
+        let shared = live.clone();
+        std::thread::spawn(move || {
+            let ddc = display::ddc_brightness();
+            if let Ok(mut l) = shared.lock() { l.ddc = ddc; }
+        });
+    }
+    let mut tick = 0u32;
     let mut prev = cpu_times();
     // Secondes passées au-dessus de PL1 : au-delà de la durée de pointe, le processeur redescend à PL1.
     let mut above_pl1 = 0.0f32;
@@ -541,7 +556,11 @@ fn spawn_monitor(ctx: egui::Context) -> Arc<Mutex<Live>> {
         }
         let temp = cpu_temp();
         let (ram_used, ram_t, board) = (ram_usage(), ram_temp(), board_sensors());
+        // Écrans et thème : toutes les 5 s (kscreen-doctor met quelques dizaines de ms).
+        tick += 1;
+        let screens = (tick % 5 == 0).then(|| (display::monitors(), display::dark_desktop()));
         if let Ok(mut l) = shared.lock() {
+            if let Some((m, dark)) = screens { l.monitors = m; l.dark_desktop = dark; }
             l.ram_used = ram_used;
             l.ram_temp = ram_t;
             if let Some(t) = ram_t { l.ram_temp_max = l.ram_temp_max.max(t); }
@@ -767,12 +786,15 @@ struct App {
     oc_target: Option<(i32, i32)>,
     hook: TestHook,
     update: SelfUpdate,
+    screens: display::Prefs,
+    screen_max: f32,
+    both_max: f32,
 }
 
 impl App {
     fn new(cc: &eframe::CreationContext) -> Self {
         style(&cc.egui_ctx);
-        App { live: spawn_monitor(cc.egui_ctx.clone()), units: read_units(), selected: String::new(), target: None, job: None, msg: None, oc_units: read_oc_units(), oc_now: None, oc_target: None, hook: TestHook::default(), update: SelfUpdate::new() }
+        App { live: spawn_monitor(cc.egui_ctx.clone()), units: read_units(), selected: String::new(), target: None, job: None, msg: None, oc_units: read_oc_units(), oc_now: None, oc_target: None, hook: TestHook::default(), update: SelfUpdate::new(), screens: display::Prefs::load(), screen_max: 0.0, both_max: 0.0 }
     }
 
     fn start(&mut self, job: Job, ctx: &egui::Context) {
@@ -840,6 +862,35 @@ fn tiles(ui: &mut egui::Ui, items: &[(&str, String, String, Color32)]) {
             for (i, (label, value, sub, color)) in row.iter().enumerate() { tile(&mut c[i], label, value.clone(), sub.clone(), *color); }
         });
     }
+}
+
+/// Luminosité (0–1, et si elle vient de l'écran), contenu choisi et clarté d'image retenus pour un écran.
+fn screen_inputs(m: &display::Monitor, live: &Live, prefs: &display::Prefs, gpu_util: f32) -> (f32, bool, display::Content, f32) {
+    let key = m.key();
+    let ddc = live.ddc.iter().find(|(c, _)| *c == m.connector).map(|(_, b)| *b);
+    let content = prefs.content(&key);
+    let apl = match content {
+        display::Content::Auto if gpu_util >= 40.0 => display::Content::Mixed.apl(),
+        display::Content::Auto if live.dark_desktop == Some(false) => display::Content::Light.apl(),
+        display::Content::Auto => 0.15,
+        c => c.apl(),
+    };
+    (ddc.unwrap_or(prefs.brightness(&key) / 100.0), ddc.is_some(), content, apl)
+}
+
+/// Ce que consomment tous les écrans branchés (W, à la prise).
+fn screens_watts(live: &Live, prefs: &display::Prefs, gpu_util: f32) -> f32 {
+    live.monitors.iter().map(|m| {
+        if !m.enabled { return m.known().map_or(0.5, |k| k.1.standby); }
+        let (b, _, _, apl) = screen_inputs(m, live, prefs, gpu_util);
+        m.watts(m.hz, b, apl)
+    }).sum()
+}
+
+/// 179.952 → « 179,95 » ; 60.0 → « 60 ».
+fn fmt_hz(hz: f32) -> String {
+    let s = format!("{hz:.2}");
+    s.trim_end_matches('0').trim_end_matches('.').replace('.', ",")
 }
 
 fn temp_color(t: f32, warm: f32, hot: f32) -> Color32 { if t >= hot { HOT } else if t >= warm { WARM } else { TEXT } }
@@ -917,19 +968,114 @@ impl eframe::App for App {
                 let cpu = &live.cpu;
                 card(ui, "Consommation en direct", |ui| {
                     let ram = live.ram.modules > 0;
-                    ui.columns(if ram { 4 } else { 3 }, |c| {
+                    // Avec un écran, « PC seul » passe sur la deuxième ligne, à côté de l'écran.
+                    let pc_here = live.monitors.is_empty() || !ram;
+                    ui.columns(if ram && pc_here { 4 } else { 3 }, |c| {
                         tile(&mut c[0], "Carte graphique", format!("{:.0} W", g.draw), format!("limite {:.0} W\nmax vu {:.0} W", g.limit, peaks.draw), TEXT);
                         tile(&mut c[1], "Processeur", format!("≈ {:.0} W", cpu.watts), format!("charge {:.0} %\nmax vu {:.0} W", cpu.util * 100.0, live.cpu_w_max), TEXT);
                         if ram {
                             tile(&mut c[2], "Mémoire vive", format!("≈ {:.0} W", live.ram_w), format!("{} barrettes\nmax vu {:.0} W", live.ram.modules, live.ram_w_max), TEXT);
                         }
-                        tile(&mut c[if ram { 3 } else { 2 }], "PC complet", format!("≈ {:.0} W", live.total()), format!("à la prise\nmax vu {:.0} W", live.total_max), ACCENT);
+                        if pc_here { tile(&mut c[if ram { 3 } else { 2 }], "PC complet", format!("≈ {:.0} W", live.total()), format!("à la prise\nmax vu {:.0} W", live.total_max), ACCENT); }
                     });
+                    if !live.monitors.is_empty() {
+                        let util = gpus.iter().map(|g| g.util).fold(0.0, f32::max);
+                        let screen = screens_watts(&live, &self.screens, util);
+                        let both = live.total() + screen;
+                        self.screen_max = self.screen_max.max(screen);
+                        self.both_max = self.both_max.max(both);
+                        let n = live.monitors.len();
+                        ui.add_space(2.0);
+                        ui.columns(3, |c| {
+                            tile(&mut c[0], "PC seul", format!("≈ {:.0} W", live.total()), format!("à la prise, sans écran\nmax vu {:.0} W", live.total_max), TEXT);
+                            tile(&mut c[1], if n > 1 { "Écrans" } else { "Écran" }, format!("≈ {screen:.0} W"), format!("{}\nmax vu {:.0} W", if n > 1 { format!("{n} écrans") } else { "estimé".to_string() }, self.screen_max), TEXT);
+                            tile(&mut c[2], if n > 1 { "PC + écrans" } else { "PC + écran" }, format!("≈ {both:.0} W"), format!("tout le bureau\nmax vu {:.0} W", self.both_max), ACCENT);
+                        });
+                    }
                     let frac = if g.limit > 0.0 { (g.draw / g.limit).clamp(0.0, 1.0) } else { 0.0 };
                     ui.add(egui::ProgressBar::new(frac).desired_height(10.0).fill(if frac > 0.95 { WARM } else { ACCENT }).corner_radius(CornerRadius::same(5)));
-                    small(ui, format!("La barre montre la carte graphique par rapport à sa limite. Carte mesurée par le pilote ; « ≈ » = estimé (processeur et mémoire n'ont pas de capteur de watts lisible). PC complet : tout ça + ≈ {REST_W:.0} W pour le reste (carte mère, SSD, ventilateurs), avec une alimentation à ≈ {:.0} % de rendement ; écran non compris.", PSU_EFFICIENCY * 100.0));
+                    small(ui, format!("La barre montre la carte graphique par rapport à sa limite. Carte mesurée par le pilote ; « ≈ » = estimé (processeur et mémoire n'ont pas de capteur de watts lisible). PC complet : tout ça + ≈ {REST_W:.0} W pour le reste (carte mère, SSD, ventilateurs), avec une alimentation à ≈ {:.0} % de rendement ; écran à part (voir la carte Écran).", PSU_EFFICIENCY * 100.0));
                 });
                 ui.add_space(10.0);
+
+                // --- Écrans
+                let util = gpus.iter().map(|g| g.util).fold(0.0, f32::max);
+                let mut changed = false;
+                for m in live.monitors.clone() {
+                    let (bright, from_ddc, mut content, apl) = screen_inputs(&m, &live, &self.screens, util);
+                    let oled = m.tech() == display::Tech::Oled;
+                    card(ui, &format!("Écran · {}", m.title()), |ui| {
+                        let mut info = vec![];
+                        if m.diagonal_in() > 5.0 { info.push(format!("{:.0}\"", m.diagonal_in())); }
+                        info.push(if oled { "OLED".to_string() } else { "LCD (rétroéclairé)".to_string() });
+                        if m.res.0 > 0 { info.push(format!("{}×{}", m.res.0, m.res.1)); }
+                        if m.hz > 0.0 { info.push(format!("{} Hz", fmt_hz(m.hz))); }
+                        if m.vrr { info.push("VRR".into()); }
+                        if m.hdr { info.push("HDR".into()); }
+                        if !m.enabled { info.push("éteint ou en veille".into()); }
+                        ui.label(RichText::new(info.join(" · ")).color(MUTED));
+                        if !m.enabled {
+                            small(ui, format!("Écran désactivé : ≈ {} W en veille.", format!("{:.1}", m.known().map_or(0.5, |k| k.1.standby)).replace('.', ",")));
+                            return;
+                        }
+                        // Consommation à chaque fréquence possible (les plus courantes si la liste est longue).
+                        let mut rates: Vec<f32> = m.rates.iter().copied().filter(|r| *r >= 50.0).collect();
+                        if rates.len() > 4 {
+                            let max = rates.last().copied().unwrap_or(m.hz);
+                            rates.retain(|r| [60.0, 120.0, 144.0].iter().any(|s| (r - s).abs() < 1.0) || (r - max).abs() < 0.1 || (r - m.hz).abs() < 0.1);
+                        }
+                        if rates.is_empty() { rates.push(m.hz); }
+                        let items: Vec<(&str, String, String, Color32)> = rates.iter().map(|&r| {
+                            let now = (r - m.hz).abs() < 0.1;
+                            (if now { "Maintenant" } else { "Si l'écran était à" }, format!("≈ {:.0} W", m.watts(r, bright, apl)), format!("{} Hz", fmt_hz(r)), if now { ACCENT } else { TEXT })
+                        }).collect();
+                        tiles(ui, &items);
+                        small(ui, "La fréquence pèse peu sur l'écran lui-même (1 à 2 W). Ce qui coûte à 180 Hz, c'est la carte graphique : en jeu, elle peut calculer jusqu'à 3 fois plus d'images qu'à 60 Hz. Pour économiser, limite plutôt les fps dans les jeux.");
+                        if m.hz > 0.0 && (m.hz - m.hz.round()).abs() > 0.01 {
+                            small(ui, format!("{} Hz au lieu de {:.0} : c'est normal. La fréquence exacte vient du signal vidéo (horloge des pixels), arrondie au plus près ; ça ne change rien à l'image.", fmt_hz(m.hz), m.hz.round()));
+                        }
+                        ui.add_space(4.0);
+                        if oled {
+                            ui.label(RichText::new("Clarté de l'image").strong());
+                            small(ui, "Sur un OLED chaque pixel s'éclaire lui-même : un écran noir ne consomme presque rien, une page blanche beaucoup.");
+                            let auto_desc = if util >= 40.0 { "jeu en cours" } else if live.dark_desktop == Some(false) { "bureau clair" } else { "bureau sombre" };
+                            let choices = [display::Content::Auto, display::Content::Dark, display::Content::Mixed, display::Content::Light];
+                            ui.columns(choices.len(), |c| {
+                                for (i, ch) in choices.iter().enumerate() {
+                                    let a = if *ch == display::Content::Auto { apl } else { ch.apl() };
+                                    let sel = content == *ch;
+                                    let desc = match ch { display::Content::Auto => auto_desc, display::Content::Dark => "thème sombre", display::Content::Mixed => "image moyenne", display::Content::Light => "pages blanches" };
+                                    let text = RichText::new(format!("{}\n≈ {:.0} W\n{desc}", ch.label(), m.watts(m.hz, bright, a))).size(13.0).color(if sel { ACCENT } else { TEXT });
+                                    let b = egui::Button::new(text).min_size(egui::vec2(c[i].available_width(), 62.0))
+                                        .fill(if sel { ACCENT_DIM } else { CARD2 }).stroke(Stroke::new(1.0_f32, if sel { ACCENT } else { LINE }));
+                                    if c[i].add(b).clicked() && !sel { content = *ch; changed = true; }
+                                }
+                            });
+                        }
+                        ui.add_space(4.0);
+                        let mut b = bright * 100.0;
+                        if m.hdr {
+                            small(ui, "HDR actif : l'écran pousse sa luminosité au maximum, le réglage du menu ne compte plus.");
+                        } else if from_ddc {
+                            small(ui, format!("Luminosité lue sur l'écran : {b:.0} %."));
+                        } else {
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new("Luminosité dans le menu de l'écran").strong());
+                                ui.label(RichText::new(format!("{b:.0} %")).strong().color(ACCENT));
+                            });
+                            ui.spacing_mut().slider_width = ui.available_width();
+                            if ui.add(egui::Slider::new(&mut b, 0.0..=100.0).step_by(5.0).show_value(false)).changed() { changed = true; }
+                            small(ui, "L'écran ne donne pas sa luminosité au PC : recopie celle de son menu (boutons de l'écran).");
+                        }
+                        if changed { self.screens.set(&m.key(), b, content); }
+                        match m.known() {
+                            Some((_, k)) => small(ui, format!("Calé sur la fiche du fabricant : ≈ {:.0} W en usage type (luminosité d'usine), {:.0} W au maximum, {} W en veille. Estimation, l'écran n'a pas de capteur de watts.", k.typical, k.max, format!("{:.1}", k.standby).replace('.', ","))),
+                            None => small(ui, "Estimation d'après la taille et la technologie de l'écran (pas de capteur de watts). Pour un chiffre exact : une prise wattmètre."),
+                        }
+                    });
+                    ui.add_space(10.0);
+                }
+                if changed { self.screens.save(); }
                 card(ui, "Températures", |ui| {
                     let b = &live.board;
                     let mut items = vec![("Carte graphique", format!("{:.0} °C", g.temp), format!("max vu {:.0} °C · ventilo {:.0} %", peaks.temp, g.fan), temp_color(g.temp, 75.0, 83.0))];

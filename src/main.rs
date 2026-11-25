@@ -1418,6 +1418,7 @@ impl eframe::App for App {
 
                 // --- Démarrage
                 card(ui, "Au démarrage", |ui| {
+                    ui.label(RichText::new("Limite de watts").strong());
                     let unit = unit_for(&self.units, &g).cloned();
                     match &unit {
                         Some(u) if u.enabled => {
@@ -1443,6 +1444,43 @@ impl eframe::App for App {
                         });
                     }
                     let file = unit.map(|u| u.file).unwrap_or_else(|| g.unit());
+                    ui.label(RichText::new(format!("{UNIT_DIR}/{file}")).monospace().size(11.5).color(MUTED));
+
+                    // Overclocking : même principe, son propre service.
+                    let Some(Ok(now)) = self.oc_now.as_ref().map(|(_, r)| r.clone()) else { return };
+                    ui.add_space(6.0);
+                    ui.separator();
+                    ui.add_space(2.0);
+                    ui.label(RichText::new("Overclocking").strong());
+                    let oc = self.oc_units.iter().find(|u| u.uuid == g.uuid).cloned();
+                    let active = now.core != 0 || now.mem != 0;
+                    match &oc {
+                        Some(u) if u.enabled => {
+                            ui.label(RichText::new(format!("Réglage permanent actif : +{} MHz graphique, +{} MHz mémoire", u.core, u.mem)).strong().color(ACCENT));
+                            ui.label(RichText::new("Appliqué à chaque démarrage et après chaque sortie de veille.").color(MUTED));
+                        }
+                        Some(u) => { ui.label(RichText::new(format!("Service présent (+{} / +{} MHz) mais désactivé.", u.core, u.mem)).strong().color(WARM)); }
+                        None if active => { ui.label(RichText::new(format!("Overclocking actif (+{} / +{} MHz) mais pas gardé : il s'efface au prochain redémarrage. « Garder au démarrage » se trouve dans la carte Overclocking.", now.core, now.mem)).color(WARM)); }
+                        None => { ui.label(RichText::new("Aucun overclocking permanent : la carte garde ses fréquences d'origine à chaque redémarrage.").color(MUTED)); }
+                    }
+                    if let Some(u) = &oc {
+                        if (now.core, now.mem) != (u.core, u.mem) {
+                            ui.label(RichText::new(format!("L'overclocking actuel (+{} / +{} MHz) ne correspond pas au réglage permanent (+{} / +{} MHz).", now.core, now.mem, u.core, u.mem)).color(WARM));
+                        }
+                        ui.add_space(4.0);
+                        let half = (ui.available_width() - 10.0) / 2.0;
+                        ui.horizontal(|ui| {
+                            if big_button(ui, !busy, &format!("Réappliquer +{} / +{} MHz", u.core, u.mem), false, half) {
+                                self.oc_target = Some((u.core, u.mem));
+                                self.start(Job::OcPersist { uuid: g.uuid.clone(), core: u.core, mem: u.mem, unit: g.oc_unit() }, ui.ctx());
+                            }
+                            if big_button(ui, !busy, "Retirer le réglage permanent", false, half) {
+                                self.oc_target = Some((0, 0));
+                                self.start(Job::OcRemove { uuid: g.uuid.clone(), unit: u.file.clone() }, ui.ctx());
+                            }
+                        });
+                    }
+                    let file = oc.map(|u| u.file).unwrap_or_else(|| g.oc_unit());
                     ui.label(RichText::new(format!("{UNIT_DIR}/{file}")).monospace().size(11.5).color(MUTED));
                 });
 

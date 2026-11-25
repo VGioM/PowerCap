@@ -53,6 +53,7 @@ Tout est lu sans mot de passe : la table DMI du BIOS (rendue lisible par udev) e
 - **Appliquer maintenant** : la limite vaut jusqu'au prochain redémarrage.
 - **Appliquer et garder au démarrage** : crée un petit service systemd qui réapplique la limite **au démarrage et après chaque sortie de veille**. Sans lui, le pilote revient à la valeur d'origine.
 - **Retirer le réglage permanent** : supprime le service et remet la carte à sa puissance d'origine.
+- La carte **Au démarrage** regroupe la limite de watts et l'overclocking : réglage gardé, réappliquer, retirer.
 - Avec plusieurs cartes NVIDIA, un menu permet de choisir la carte. Chacune a son propre réglage.
 
 ### Overclocking de la carte (facultatif)

@@ -11,8 +11,10 @@ Moins de watts, c'est moins de chaleur dans le boîtier et moins de bruit, surto
 ### Consommation en direct
 - **Carte graphique** : consommation mesurée par le pilote NVIDIA.
 - **Processeur (estimé)** : calculé d'après sa charge et sa fréquence, et plafonné par ses limites PL1/PL2. Le compteur d'énergie exact du processeur n'est lisible qu'en administrateur, d'où l'estimation.
-- **PC complet (estimé)** : carte + processeur + environ 35 W pour le reste (carte mère, mémoire, SSD, ventilateurs), avec une alimentation à environ 90 % de rendement. C'est ce que le PC tire **à la prise**, écran non compris.
-- **Températures** de la carte et du processeur, et fréquences.
+- **PC complet (estimé)** : carte + processeur + mémoire + environ 30 W pour le reste (carte mère, SSD, ventilateurs), avec une alimentation à environ 90 % de rendement. C'est ce que le PC tire **à la prise**, écran non compris.
+- **Mémoire vive (estimée)** : les barrettes n'ont pas de capteur de watts. L'estimation part de leur nombre, de leur type, de leur tension (1,35 V avec XMP) et de l'activité du PC : en général 3 à 12 W pour deux barrettes DDR5.
+- **Températures** : carte graphique, processeur, mémoire vive (barrettes DDR5 et certaines DDR4), SSD NVMe, carte mère (chipset), et vitesse des ventilateurs. Seuls les capteurs présents sont affichés ; orange = chaud, rouge = très chaud. Les disques durs SATA ne sont pas lus, pour ne pas les réveiller.
+- **Fréquences et charge** : processeur, carte graphique, et mémoire vidéo occupée.
 - Pour chaque mesure, le **maximum vu** depuis l'ouverture de l'app : laisse PowerCap ouvert pendant une partie pour voir les pics.
 
 ### Mémoire vive

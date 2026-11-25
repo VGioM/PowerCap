@@ -167,6 +167,8 @@ struct Gpu {
     index: u32, uuid: String, name: String,
     draw: f32, limit: f32, default: f32, min: f32, max: f32,
     temp: f32, fan: f32, clock: f32, mem_clock: f32, util: f32,
+    /// Mémoire vidéo utilisée et totale, en Mio.
+    vram_used: f32, vram_total: f32,
 }
 
 impl Gpu {
@@ -184,17 +186,17 @@ impl Gpu {
 
 fn num(s: &str) -> f32 { s.trim().parse().unwrap_or(0.0) }
 
-const QUERY: &str = "--query-gpu=index,uuid,name,power.draw,power.limit,power.default_limit,power.min_limit,power.max_limit,temperature.gpu,fan.speed,clocks.sm,clocks.mem,utilization.gpu";
+const QUERY: &str = "--query-gpu=index,uuid,name,power.draw,power.limit,power.default_limit,power.min_limit,power.max_limit,temperature.gpu,fan.speed,clocks.sm,clocks.mem,utilization.gpu,memory.used,memory.total";
 
 fn parse_gpu(line: &str) -> Result<Gpu, String> {
     let f: Vec<&str> = line.split(',').map(str::trim).collect();
-    if f.len() < 13 { return Err(format!("Réponse inattendue de nvidia-smi : {line}")); }
-    // Le nom peut, en théorie, contenir des virgules : les 10 derniers champs sont numériques.
-    let n = f.len();
+    // Le nom peut, en théorie, contenir des virgules : les 12 derniers champs sont numériques.
+    if f.len() < 15 { return Err(format!("Réponse inattendue de nvidia-smi : {line}")); }
+    let v: Vec<f32> = f[f.len() - 12..].iter().map(|x| num(x)).collect();
     Ok(Gpu {
-        index: f[0].parse().unwrap_or(0), uuid: f[1].to_string(), name: f[2..n - 10].join(", "),
-        draw: num(f[n - 10]), limit: num(f[n - 9]), default: num(f[n - 8]), min: num(f[n - 7]), max: num(f[n - 6]),
-        temp: num(f[n - 5]), fan: num(f[n - 4]), clock: num(f[n - 3]), mem_clock: num(f[n - 2]), util: num(f[n - 1]),
+        index: f[0].parse().unwrap_or(0), uuid: f[1].to_string(), name: f[2..f.len() - 12].join(", "),
+        draw: v[0], limit: v[1], default: v[2], min: v[3], max: v[4],
+        temp: v[5], fan: v[6], clock: v[7], mem_clock: v[8], util: v[9], vram_used: v[10], vram_total: v[11],
     })
 }
 
@@ -309,6 +311,8 @@ struct RamKit {
     kind: String, modules: u32, module_gb: f32,
     /// Vitesse max annoncée par le BIOS, vitesse réglée, vitesse inscrite dans la référence.
     speed: u32, configured: u32, rated: u32,
+    /// Tension maximale des barrettes (celle du profil XMP), en V.
+    voltage: f32,
     maker: String, part: String,
 }
 
@@ -372,6 +376,7 @@ fn parse_ram_kit(text: &str) -> RamKit {
         kit.speed = kit.speed.max(speed);
         // Plusieurs barrettes tournent toujours à la même vitesse : la plus basse fait foi.
         if conf > 0 { kit.configured = if kit.configured == 0 { conf } else { kit.configured.min(conf) }; }
+        kit.voltage = kit.voltage.max(get("MAXIMUM_VOLTAGE").parse().unwrap_or(0.0));
         if kit.part.is_empty() { kit.part = get("PART_NUMBER").to_string(); }
         if kit.maker.is_empty() { kit.maker = get("MANUFACTURER").to_string(); }
     }
@@ -408,6 +413,24 @@ fn xmp_state(k: &RamKit) -> Xmp {
     }
 }
 
+/// Tension de travail des barrettes : la norme, ou celle du profil XMP s'il est actif.
+fn ram_voltage(k: &RamKit) -> Option<f32> {
+    let nominal = match k.kind.as_str() { "DDR5" => 1.1, "DDR4" => 1.2, "DDR3" => 1.5, _ => return None };
+    Some(if xmp_state(k) == Xmp::On && k.voltage > nominal { k.voltage } else { nominal })
+}
+
+/// Consommation estimée de la mémoire vive, en W. Les barrettes n'ont pas de
+/// capteur de puissance : on part d'environ 1,2 W par barrette DDR5 au repos et
+/// 4 W en pleine activité (DDR4 : 1 à 3 W), selon la charge du processeur, la
+/// taille des barrettes et le carré de la tension (1,35 V en XMP ≈ +50 %).
+fn ram_power_estimate(k: &RamKit, util: f32) -> f32 {
+    if k.modules == 0 { return 0.0; }
+    let (idle, load, nominal) = match k.kind.as_str() { "DDR5" => (1.2, 4.0, 1.1), "DDR3" => (1.0, 3.0, 1.5), _ => (1.0, 3.0, 1.2) };
+    let volt = ram_voltage(k).map(|v| (v / nominal).powi(2)).unwrap_or(1.0);
+    let size = (k.module_gb / 16.0).clamp(0.5, 2.0).sqrt();
+    k.modules as f32 * (idle + (load - idle) * util.clamp(0.0, 1.0)) * volt * size
+}
+
 /// Mémoire utilisée et totale, en Go (Gio), d'après /proc/meminfo.
 fn ram_usage() -> Option<(f32, f32)> {
     let info = std::fs::read_to_string("/proc/meminfo").ok()?;
@@ -425,9 +448,41 @@ fn ram_temp() -> Option<f32> {
     }).reduce(f32::max)
 }
 
-/// Le reste du PC (carte mère, mémoire, SSD, ventilateurs, USB), en W, et le
+/// Températures des SSD NVMe, de la carte mère, et vitesse des ventilateurs.
+#[derive(Clone, Default, Debug, PartialEq)]
+struct Board { ssd: Vec<f32>, chipset: Option<f32>, board: Option<f32>, fans: Vec<u32> }
+
+fn board_sensors() -> Board {
+    let mut b = Board::default();
+    let Ok(dir) = std::fs::read_dir("/sys/class/hwmon") else { return b };
+    let mut dirs: Vec<_> = dir.flatten().map(|e| e.path()).collect();
+    dirs.sort();
+    for p in dirs {
+        let name = std::fs::read_to_string(p.join("name")).unwrap_or_default().trim().to_string();
+        // Les disques durs SATA (drivetemp) sont laissés de côté : les lire peut les réveiller.
+        if name == "nvme" {
+            if let Some(t) = read_f(&p.join("temp1_input")) { b.ssd.push(t / 1000.0); }
+            continue;
+        }
+        if matches!(name.as_str(), "amdgpu" | "radeon" | "nouveau" | "coretemp" | "k10temp" | "spd5118" | "jc42") || name.starts_with("hidpp") { continue; }
+        for i in 1..=32 {
+            let Some(t) = read_f(&p.join(format!("temp{i}_input"))).map(|v| v / 1000.0).filter(|t| (5.0..=125.0).contains(t)) else { continue };
+            match std::fs::read_to_string(p.join(format!("temp{i}_label"))).unwrap_or_default().trim() {
+                "PCH_CHIP_TEMP" | "Chipset" | "PCH" => { b.chipset.get_or_insert(t); }
+                "SYSTIN" | "Motherboard" => { b.board.get_or_insert(t); }
+                _ => {}
+            }
+        }
+        for i in 1..=16 {
+            if let Some(r) = read_f(&p.join(format!("fan{i}_input"))).filter(|r| *r > 0.0 && *r < 20000.0) { b.fans.push(r as u32); }
+        }
+    }
+    b
+}
+
+/// Le reste du PC (carte mère, SSD, ventilateurs, USB), en W, et le
 /// rendement typique d'une alimentation 80 Plus Gold à charge moyenne.
-const REST_W: f32 = 35.0;
+const REST_W: f32 = 30.0;
 const PSU_EFFICIENCY: f32 = 0.90;
 
 #[derive(Clone, Copy, Default)]
@@ -448,19 +503,24 @@ struct Live {
     /// Mémoire utilisée / totale (Go), température des barrettes.
     ram_used: Option<(f32, f32)>,
     ram_temp: Option<f32>,
+    ram_temp_max: f32,
+    ram_w: f32,
+    ram_w_max: f32,
+    board: Board,
 }
 
 impl Live {
     /// Consommation du PC complet à la prise (hors écran), en W.
     fn total(&self) -> f32 {
         let gpus: f32 = self.gpus.as_ref().map(|l| l.iter().map(|g| g.draw).sum()).unwrap_or(0.0);
-        (gpus + self.cpu.watts + REST_W) / PSU_EFFICIENCY
+        (gpus + self.cpu.watts + self.ram_w + REST_W) / PSU_EFFICIENCY
     }
 }
 
 fn spawn_monitor(ctx: egui::Context) -> Arc<Mutex<Live>> {
     let live = Arc::new(Mutex::new(Live { gpus: Err("Lecture des cartes graphiques…".into()), cpu: Cpu { name: cpu_name(), ..Default::default() },
-        cpu_max: 0.0, cpu_w_max: 0.0, total_max: 0.0, peaks: HashMap::new(), ram: ram_kit(), ram_used: ram_usage(), ram_temp: None }));
+        cpu_max: 0.0, cpu_w_max: 0.0, total_max: 0.0, peaks: HashMap::new(), ram: ram_kit(), ram_used: ram_usage(), ram_temp: None, ram_temp_max: 0.0,
+        ram_w: 0.0, ram_w_max: 0.0, board: Board::default() }));
     let shared = live.clone();
     let mut prev = cpu_times();
     // Secondes passées au-dessus de PL1 : au-delà de la durée de pointe, le processeur redescend à PL1.
@@ -480,10 +540,14 @@ fn spawn_monitor(ctx: egui::Context) -> Arc<Mutex<Live>> {
             if watts > pl1 { above_pl1 += 1.0; if above_pl1 > tau { watts = pl1; } } else { above_pl1 = 0.0; }
         }
         let temp = cpu_temp();
-        let (ram_used, ram_t) = (ram_usage(), ram_temp());
+        let (ram_used, ram_t, board) = (ram_usage(), ram_temp(), board_sensors());
         if let Ok(mut l) = shared.lock() {
             l.ram_used = ram_used;
             l.ram_temp = ram_t;
+            if let Some(t) = ram_t { l.ram_temp_max = l.ram_temp_max.max(t); }
+            l.ram_w = ram_power_estimate(&l.ram, util);
+            l.ram_w_max = l.ram_w_max.max(l.ram_w);
+            l.board = board;
             if let Ok(list) = &gpus {
                 for g in list {
                     let p = l.peaks.entry(g.uuid.clone()).or_default();
@@ -740,6 +804,16 @@ fn tile(ui: &mut egui::Ui, label: &str, value: String, sub: String, color: Color
     });
 }
 
+/// Tuiles rangées par 3 ; seules celles qui ont une mesure sont affichées.
+fn tiles(ui: &mut egui::Ui, items: &[(&str, String, String, Color32)]) {
+    for (r, row) in items.chunks(3).enumerate() {
+        if r > 0 { ui.add_space(2.0); }
+        ui.columns(3, |c| {
+            for (i, (label, value, sub, color)) in row.iter().enumerate() { tile(&mut c[i], label, value.clone(), sub.clone(), *color); }
+        });
+    }
+}
+
 fn temp_color(t: f32, warm: f32, hot: f32) -> Color32 { if t >= hot { HOT } else if t >= warm { WARM } else { TEXT } }
 
 fn small(ui: &mut egui::Ui, text: impl Into<String>) { ui.label(RichText::new(text).size(12.5).color(MUTED)); }
@@ -814,26 +888,57 @@ impl eframe::App for App {
                 // --- En direct
                 let cpu = &live.cpu;
                 card(ui, "Consommation en direct", |ui| {
-                    ui.columns(3, |c| {
-                        tile(&mut c[0], "Carte graphique", format!("{:.0} W", g.draw), format!("limite {:.0} W · max vu {:.0} W", g.limit, peaks.draw), TEXT);
-                        tile(&mut c[1], "Processeur (estimé)", format!("≈ {:.0} W", cpu.watts), format!("charge {:.0} % · max vu {:.0} W", cpu.util * 100.0, live.cpu_w_max), TEXT);
-                        tile(&mut c[2], "PC complet (estimé)", format!("≈ {:.0} W", live.total()), format!("à la prise · max vu {:.0} W", live.total_max), ACCENT);
+                    let ram = live.ram.modules > 0;
+                    ui.columns(if ram { 4 } else { 3 }, |c| {
+                        tile(&mut c[0], "Carte graphique", format!("{:.0} W", g.draw), format!("limite {:.0} W\nmax vu {:.0} W", g.limit, peaks.draw), TEXT);
+                        tile(&mut c[1], "Processeur", format!("≈ {:.0} W", cpu.watts), format!("charge {:.0} %\nmax vu {:.0} W", cpu.util * 100.0, live.cpu_w_max), TEXT);
+                        if ram {
+                            tile(&mut c[2], "Mémoire vive", format!("≈ {:.0} W", live.ram_w), format!("{} barrettes\nmax vu {:.0} W", live.ram.modules, live.ram_w_max), TEXT);
+                        }
+                        tile(&mut c[if ram { 3 } else { 2 }], "PC complet", format!("≈ {:.0} W", live.total()), format!("à la prise\nmax vu {:.0} W", live.total_max), ACCENT);
                     });
                     let frac = if g.limit > 0.0 { (g.draw / g.limit).clamp(0.0, 1.0) } else { 0.0 };
                     ui.add(egui::ProgressBar::new(frac).desired_height(10.0).fill(if frac > 0.95 { WARM } else { ACCENT }).corner_radius(CornerRadius::same(5)));
-                    small(ui, format!("Carte mesurée par le pilote. Processeur estimé d'après sa charge et sa fréquence. PC complet : carte + processeur + ≈ {REST_W:.0} W pour le reste (carte mère, mémoire, SSD, ventilateurs), avec une alimentation à ≈ {:.0} % de rendement ; écran non compris.", PSU_EFFICIENCY * 100.0));
+                    small(ui, format!("La barre montre la carte graphique par rapport à sa limite. Carte mesurée par le pilote ; « ≈ » = estimé (processeur et mémoire n'ont pas de capteur de watts lisible). PC complet : tout ça + ≈ {REST_W:.0} W pour le reste (carte mère, SSD, ventilateurs), avec une alimentation à ≈ {:.0} % de rendement ; écran non compris.", PSU_EFFICIENCY * 100.0));
                 });
                 ui.add_space(10.0);
                 card(ui, "Températures", |ui| {
-                    ui.columns(3, |c| {
-                        tile(&mut c[0], "Carte graphique", format!("{:.0} °C", g.temp), format!("max vu {:.0} °C · ventilo {:.0} %", peaks.temp, g.fan), temp_color(g.temp, 75.0, 83.0));
-                        match cpu.temp {
-                            Some(t) => tile(&mut c[1], "Processeur", format!("{t:.0} °C"), format!("max vu {:.0} °C", live.cpu_max), temp_color(t, 85.0, 95.0)),
-                            None => tile(&mut c[1], "Processeur", "—".into(), "capteur introuvable".into(), MUTED),
-                        }
-                        tile(&mut c[2], "Fréquences", format!("{:.1} GHz", cpu.freq), format!("processeur, max {:.1} GHz", cpu.max_freq), TEXT);
+                    let b = &live.board;
+                    let mut items = vec![("Carte graphique", format!("{:.0} °C", g.temp), format!("max vu {:.0} °C · ventilo {:.0} %", peaks.temp, g.fan), temp_color(g.temp, 75.0, 83.0))];
+                    items.push(match cpu.temp {
+                        Some(t) => ("Processeur", format!("{t:.0} °C"), format!("max vu {:.0} °C", live.cpu_max), temp_color(t, 85.0, 95.0)),
+                        None => ("Processeur", "—".into(), "capteur introuvable".into(), MUTED),
                     });
-                    small(ui, "Les « max vu » comptent depuis l'ouverture de PowerCap : laisse-le ouvert pendant une partie pour voir les pics.");
+                    if let Some(t) = live.ram_temp {
+                        items.push(("Mémoire vive", format!("{t:.0} °C"), format!("max vu {:.0} °C", live.ram_temp_max), temp_color(t, 60.0, 75.0)));
+                    }
+                    if let Some(t) = b.ssd.iter().copied().reduce(f32::max) {
+                        let sub = if b.ssd.len() > 1 { format!("le plus chaud des {} SSD", b.ssd.len()) } else { "SSD NVMe".into() };
+                        items.push(("Stockage", format!("{t:.0} °C"), sub, temp_color(t, 60.0, 70.0)));
+                    }
+                    if let Some(t) = b.chipset.or(b.board) {
+                        let sub = match (b.chipset, b.board) { (Some(_), Some(m)) => format!("chipset · capteur carte {m:.0} °C"), (Some(_), None) => "chipset".into(), _ => "capteur de la carte".into() };
+                        items.push(("Carte mère", format!("{t:.0} °C"), sub, temp_color(t, 75.0, 90.0)));
+                    }
+                    if !b.fans.is_empty() {
+                        let value = if b.fans.len() <= 3 { b.fans.iter().map(u32::to_string).collect::<Vec<_>>().join(" · ") } else { format!("{}–{}", b.fans.iter().min().unwrap(), b.fans.iter().max().unwrap()) };
+                        items.push(("Ventilateurs", value, format!("tr/min · {} en marche", b.fans.len()), TEXT));
+                    }
+                    tiles(ui, &items);
+                    small(ui, "Orange : chaud, rouge : très chaud. Les « max vu » comptent depuis l'ouverture de PowerCap : laisse-le ouvert pendant une partie pour voir les pics.");
+                });
+                ui.add_space(10.0);
+                card(ui, "Fréquences et charge", |ui| {
+                    let mut items = vec![
+                        ("Processeur", format!("{:.1} GHz", cpu.freq), format!("max {:.1} GHz · charge {:.0} %", cpu.max_freq, cpu.util * 100.0), TEXT),
+                        ("Carte graphique", format!("{:.0} MHz", g.clock), format!("charge {:.0} %", g.util), TEXT),
+                    ];
+                    if g.vram_total > 0.0 {
+                        let frac = g.vram_used / g.vram_total;
+                        items.push(("Mémoire vidéo", format!("{:.1} / {:.0} Go", g.vram_used / 1024.0, g.vram_total / 1024.0), format!("{:.0} % occupée", frac * 100.0), temp_color(frac, 0.85, 0.95)));
+                    }
+                    tiles(ui, &items);
+                    small(ui, "Au repos, fréquences et charge sont basses : c'est normal, elles montent en jeu. Mémoire vidéo presque pleine : baisse la qualité des textures.");
                 });
                 ui.add_space(10.0);
 
@@ -858,7 +963,8 @@ impl eframe::App for App {
                             Xmp::Standard => ("Standard", "JEDEC, sans XMP", TEXT),
                             Xmp::Unknown => ("—", "non déterminé", MUTED),
                         };
-                        tile(&mut c[2], "Profil", name.into(), sub.into(), color);
+                        let sub = match ram_voltage(k) { Some(v) => format!("{sub} · {v:.2} V"), None => sub.into() };
+                        tile(&mut c[2], "Profil", name.into(), sub, color);
                     });
                     match xmp {
                         Xmp::On => { ui.label(RichText::new(format!("La mémoire tourne à {} MT/s, au-dessus de la norme ({} MT/s) : le profil XMP (ou EXPO chez AMD) est bien activé dans le BIOS.", k.configured, jedec_max(&k.kind).unwrap_or(0))).color(ACCENT)); }
@@ -866,8 +972,7 @@ impl eframe::App for App {
                         Xmp::Standard => small(ui, "Vitesse standard. Si la boîte de tes barrettes annonce plus (par ex. 6000 MT/s), active le profil XMP dans le BIOS."),
                         Xmp::Unknown => {}
                     }
-                    let mut info = [k.maker.as_str(), k.part.as_str()].iter().filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("Not Specified")).copied().collect::<Vec<_>>().join(" ");
-                    if let Some(t) = live.ram_temp { info = if info.is_empty() { format!("barrettes à {t:.0} °C") } else { format!("{info} · barrettes à {t:.0} °C") }; }
+                    let info = [k.maker.as_str(), k.part.as_str()].iter().filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("Not Specified")).copied().collect::<Vec<_>>().join(" ");
                     small(ui, format!("{}MT/s = mégatransferts par seconde, le chiffre des boîtes (DDR5-6000 = 6000 MT/s, soit 3000 MHz réels).", if info.is_empty() { String::new() } else { format!("{info}. ") }));
                 });
                 ui.add_space(10.0);
@@ -1222,19 +1327,20 @@ mod tests {
 
     #[test]
     fn parses_nvidia_smi_lines() {
-        let g = parse_gpu("0, GPU-ebab68d5-d9c6-1718-88bf-c79a87a14bc7, NVIDIA GeForce RTX 4070, 21.24, 200.00, 200.00, 100.00, 216.00, 39, 0, 2490, 10501, 3").unwrap();
+        let g = parse_gpu("0, GPU-ebab68d5-d9c6-1718-88bf-c79a87a14bc7, NVIDIA GeForce RTX 4070, 21.24, 200.00, 200.00, 100.00, 216.00, 39, 0, 2490, 10501, 3, 1191, 12282").unwrap();
         assert_eq!(g.name, "NVIDIA GeForce RTX 4070");
         assert_eq!((g.limit, g.default, g.min, g.max, g.mem_clock, g.util), (200.0, 200.0, 100.0, 216.0, 10501.0, 3.0));
+        assert_eq!((g.vram_used, g.vram_total), (1191.0, 12282.0));
         assert!(g.adjustable());
         assert_eq!(g.unit(), "powercap-gpu-ebab68d5.service");
         assert_eq!(g.oc_unit(), "powercap-oc-ebab68d5.service");
         // Carte de portable : limites non disponibles.
-        let g = parse_gpu("1, GPU-1234, NVIDIA GeForce RTX 4060 Laptop GPU, [N/A], [N/A], [N/A], [N/A], [N/A], 40, [N/A], 0, 0, 0").unwrap();
+        let g = parse_gpu("1, GPU-1234, NVIDIA GeForce RTX 4060 Laptop GPU, [N/A], [N/A], [N/A], [N/A], [N/A], 40, [N/A], 0, 0, 0, [N/A], [N/A]").unwrap();
         assert_eq!((g.index, g.draw), (1, 0.0));
         assert!(!g.adjustable());
         // Nom avec virgule.
-        let g = parse_gpu("0, GPU-x, A, B, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10").unwrap();
-        assert_eq!((g.name.as_str(), g.util), ("A, B", 10.0));
+        let g = parse_gpu("0, GPU-x, A, B, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12").unwrap();
+        assert_eq!((g.name.as_str(), g.util, g.vram_total), ("A, B", 10.0, 12.0));
         assert!(parse_gpu("rien").is_err());
     }
 
@@ -1284,7 +1390,7 @@ mod tests {
         }
         let dmi = "E:MEMORY_DEVICE_0_SIZE=17179869184\nE:MEMORY_DEVICE_0_TYPE=DDR5\nE:MEMORY_DEVICE_0_SPEED_MTS=6000\n\
             E:MEMORY_DEVICE_0_CONFIGURED_SPEED_MTS=6000\nE:MEMORY_DEVICE_0_PART_NUMBER=CP16G60C36U5B.M8D1\n\
-            E:MEMORY_DEVICE_0_MANUFACTURER=Micron Technology\nE:MEMORY_DEVICE_1_SIZE=17179869184\n\
+            E:MEMORY_DEVICE_0_MANUFACTURER=Micron Technology\nE:MEMORY_DEVICE_0_MAXIMUM_VOLTAGE=1.35\nE:MEMORY_DEVICE_1_SIZE=17179869184\n\
             E:MEMORY_DEVICE_1_CONFIGURED_SPEED_MTS=6000\nE:MEMORY_DEVICE_2_SIZE=0\n";
         let k = parse_ram_kit(dmi);
         assert_eq!((k.modules, k.module_gb, k.kind.as_str(), k.configured, k.max()), (2, 16.0, "DDR5", 6000, 6000));
@@ -1295,6 +1401,14 @@ mod tests {
         let plain = RamKit { kind: "DDR4".into(), speed: 3200, configured: 3200, rated: 0, ..Default::default() };
         assert_eq!(xmp_state(&plain), Xmp::Standard);
         assert_eq!(xmp_state(&RamKit::default()), Xmp::Unknown);
+        // Tension : 1,35 V avec XMP, 1,1 V sans.
+        assert_eq!(ram_voltage(&k), Some(1.35));
+        assert_eq!(ram_voltage(&off), Some(1.1));
+        // Consommation : 2 barrettes DDR5 XMP, ≈ 3,6 W au repos, ≈ 12 W à fond ; moins sans XMP.
+        let (idle, full) = (ram_power_estimate(&k, 0.0), ram_power_estimate(&k, 1.0));
+        assert!((3.0..4.5).contains(&idle) && (10.0..13.0).contains(&full), "{idle} {full}");
+        assert!(ram_power_estimate(&off, 1.0) < full);
+        assert_eq!(ram_power_estimate(&RamKit::default(), 1.0), 0.0);
     }
 
     #[test]

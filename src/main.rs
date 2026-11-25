@@ -1,10 +1,12 @@
 //! PowerCap : règle la limite de puissance (en watts) des cartes graphiques
 //! NVIDIA sous Linux, et montre en direct ce que consomment la carte, le
-//! processeur (estimation, avec ses limites PL1/PL2) et le PC complet. Le
-//! réglage de la carte s'applique tout de suite et, si on le demande, à chaque
-//! démarrage et après chaque mise en veille grâce à un petit service systemd
-//! par carte (/etc/systemd/system/powercap-gpu-<id>.service). Les actions qui
-//! demandent les droits administrateur passent par pkexec.
+//! processeur (estimation, avec ses limites PL1/PL2) et le PC complet, ainsi
+//! que la mémoire vive (occupation, fréquence, XMP). Il permet aussi un
+//! overclocking encadré de la carte (décalages de fréquence par NVML). Les
+//! réglages s'appliquent tout de suite et, si on le demande, à chaque démarrage
+//! et après chaque mise en veille grâce à de petits services systemd par carte
+//! (/etc/systemd/system/powercap-gpu-<id>.service, powercap-oc-<id>.service).
+//! Les actions qui demandent les droits administrateur passent par pkexec.
 
 use eframe::egui::{self, Color32, CornerRadius, Margin, RichText, Stroke};
 use std::collections::HashMap;
@@ -12,6 +14,7 @@ use std::process::Command;
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
+mod nvml;
 mod selfupdate;
 use selfupdate::SelfUpdate;
 
@@ -19,6 +22,73 @@ const UNIT_DIR: &str = "/etc/systemd/system";
 const UNIT_PREFIX: &str = "powercap-gpu";
 /// Préfixe des services créés par les versions 1.0.0 et 1.0.1 (alors appelées Watts).
 const LEGACY_PREFIX: &str = "watts-gpu-power";
+const OC_PREFIX: &str = "powercap-oc";
+const PYTHON: &str = "/usr/bin/python3";
+
+/// Règle les décalages de fréquence d'une carte par NVML (lancé en administrateur).
+/// Arguments : UUID de la carte, décalage du processeur graphique, de la mémoire (MHz).
+/// La carte garde sa tension et ses limites de température : seul le décalage change.
+const OC_PY: &str = r#"import ctypes as C, re, sys
+uuid, core, mem = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+if not re.fullmatch(r"GPU-[A-Za-z0-9-]+", uuid): sys.exit("carte invalide")
+if not (0 <= core <= 1000 and 0 <= mem <= 6000): sys.exit("valeur invalide")
+n = C.CDLL("libnvidia-ml.so.1")
+n.nvmlErrorString.restype = C.c_char_p
+def ok(r, what):
+    if r != 0: sys.exit(what + " : " + n.nvmlErrorString(r).decode())
+ok(n.nvmlInit_v2(), "NVML")
+h = C.c_void_p()
+ok(n.nvmlDeviceGetHandleByUUID(uuid.encode(), C.byref(h)), "carte introuvable")
+ok(n.nvmlDeviceSetGpcClkVfOffset(h, core), "fréquence du processeur graphique")
+ok(n.nvmlDeviceSetMemClkVfOffset(h, mem), "fréquence de la mémoire vidéo")
+"#;
+
+/// Installe le script Python et le service qui remet l'overclocking au démarrage
+/// et après la veille. `$1` = UUID, `$2` = décalage graphique, `$3` = mémoire, `$4` = service, `$5` = script.
+const OC_PERSIST_SCRIPT: &str = r#"set -e
+case "$1" in GPU-*) ;; *) echo "carte invalide" >&2; exit 2;; esac
+case "$1" in *[!A-Za-z0-9-]*) echo "carte invalide" >&2; exit 2;; esac
+case "$2" in ''|*[!0-9]*) echo "valeur invalide" >&2; exit 2;; esac
+case "$3" in ''|*[!0-9]*) echo "valeur invalide" >&2; exit 2;; esac
+case "$4" in powercap-oc-*.service) ;; *) echo "service invalide" >&2; exit 2;; esac
+case "$4" in */*|*[!A-Za-z0-9.-]*) echo "service invalide" >&2; exit 2;; esac
+mkdir -p /etc/powercap
+printf '%s' "$5" > /etc/powercap/gpu-oc.py
+chmod 644 /etc/powercap/gpu-oc.py
+cat > "/etc/systemd/system/$4" <<UNIT
+# Créé par PowerCap (https://github.com/VGioM/PowerCap) : overclocking d'une
+# carte graphique NVIDIA, remis au démarrage et après chaque veille.
+# Pour l'enlever : PowerCap, « Retirer », ou systemctl disable --now $4
+[Unit]
+Description=Overclocking NVIDIA $1 (+$2 MHz graphique, +$3 MHz mémoire, réglé avec PowerCap)
+After=nvidia-persistenced.service display-manager.service suspend.target hibernate.target hybrid-sleep.target suspend-then-hibernate.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 -I /etc/powercap/gpu-oc.py $1 $2 $3
+
+[Install]
+WantedBy=graphical.target suspend.target hibernate.target hybrid-sleep.target suspend-then-hibernate.target
+UNIT
+chmod 644 "/etc/systemd/system/$4"
+systemctl daemon-reload
+systemctl reenable "$4"
+/usr/bin/python3 -I /etc/powercap/gpu-oc.py "$1" "$2" "$3"
+"#;
+
+/// Retire le service d'overclocking et remet les fréquences d'origine.
+/// `$1` = UUID, `$2` = service, `$3` = script Python.
+const OC_REMOVE_SCRIPT: &str = r#"set -e
+case "$1" in GPU-*) ;; *) echo "carte invalide" >&2; exit 2;; esac
+case "$1" in *[!A-Za-z0-9-]*) echo "carte invalide" >&2; exit 2;; esac
+case "$2" in powercap-oc-*.service) ;; *) echo "service invalide" >&2; exit 2;; esac
+case "$2" in */*|*[!A-Za-z0-9.-]*) echo "service invalide" >&2; exit 2;; esac
+systemctl disable "$2" >/dev/null 2>&1 || true
+rm -f "/etc/systemd/system/$2"
+systemctl daemon-reload
+if ! ls /etc/systemd/system/powercap-oc-*.service >/dev/null 2>&1; then rm -f /etc/powercap/gpu-oc.py; rmdir /etc/powercap 2>/dev/null || true; fi
+/usr/bin/python3 -I -c "$3" "$1" 0 0
+"#;
 
 /// Écrit le service de la carte, l'active et applique la limite.
 /// `$1` = watts, `$2` = UUID de la carte, `$3` = nom du service.
@@ -96,32 +166,35 @@ fn nvsmi() -> String {
 struct Gpu {
     index: u32, uuid: String, name: String,
     draw: f32, limit: f32, default: f32, min: f32, max: f32,
-    temp: f32, fan: f32, clock: f32, util: f32,
+    temp: f32, fan: f32, clock: f32, mem_clock: f32, util: f32,
 }
 
 impl Gpu {
     /// Les cartes de PC portables (et certaines anciennes) refusent le réglage.
     fn adjustable(&self) -> bool { self.default > 0.0 && self.min > 0.0 && self.max > self.min }
     /// Nom du service systemd propre à cette carte (stable : tiré de l'UUID).
-    fn unit(&self) -> String {
+    fn unit(&self) -> String { format!("{UNIT_PREFIX}-{}.service", self.id()) }
+    /// Service d'overclocking de cette carte.
+    fn oc_unit(&self) -> String { format!("{OC_PREFIX}-{}.service", self.id()) }
+    fn id(&self) -> String {
         let id: String = self.uuid.trim_start_matches("GPU-").chars().filter(|c| c.is_ascii_alphanumeric()).take(8).collect();
-        format!("{UNIT_PREFIX}-{}.service", if id.is_empty() { self.index.to_string() } else { id.to_lowercase() })
+        if id.is_empty() { self.index.to_string() } else { id.to_lowercase() }
     }
 }
 
 fn num(s: &str) -> f32 { s.trim().parse().unwrap_or(0.0) }
 
-const QUERY: &str = "--query-gpu=index,uuid,name,power.draw,power.limit,power.default_limit,power.min_limit,power.max_limit,temperature.gpu,fan.speed,clocks.sm,utilization.gpu";
+const QUERY: &str = "--query-gpu=index,uuid,name,power.draw,power.limit,power.default_limit,power.min_limit,power.max_limit,temperature.gpu,fan.speed,clocks.sm,clocks.mem,utilization.gpu";
 
 fn parse_gpu(line: &str) -> Result<Gpu, String> {
     let f: Vec<&str> = line.split(',').map(str::trim).collect();
-    if f.len() < 12 { return Err(format!("Réponse inattendue de nvidia-smi : {line}")); }
-    // Le nom peut, en théorie, contenir des virgules : les 9 derniers champs sont numériques.
+    if f.len() < 13 { return Err(format!("Réponse inattendue de nvidia-smi : {line}")); }
+    // Le nom peut, en théorie, contenir des virgules : les 10 derniers champs sont numériques.
     let n = f.len();
     Ok(Gpu {
-        index: f[0].parse().unwrap_or(0), uuid: f[1].to_string(), name: f[2..n - 9].join(", "),
-        draw: num(f[n - 9]), limit: num(f[n - 8]), default: num(f[n - 7]), min: num(f[n - 6]), max: num(f[n - 5]),
-        temp: num(f[n - 4]), fan: num(f[n - 3]), clock: num(f[n - 2]), util: num(f[n - 1]),
+        index: f[0].parse().unwrap_or(0), uuid: f[1].to_string(), name: f[2..n - 10].join(", "),
+        draw: num(f[n - 10]), limit: num(f[n - 9]), default: num(f[n - 8]), min: num(f[n - 7]), max: num(f[n - 6]),
+        temp: num(f[n - 5]), fan: num(f[n - 4]), clock: num(f[n - 3]), mem_clock: num(f[n - 2]), util: num(f[n - 1]),
     })
 }
 
@@ -227,6 +300,131 @@ fn cpu_power_estimate(util: f32, freq_ratio: f32, limits: &CpuLimits) -> f32 {
     (idle + (peak - idle) * util.clamp(0.0, 1.0) * f * f).min(peak)
 }
 
+// ---------------------------------------------------------------- mémoire vive
+
+/// Barrettes installées, d'après la table DMI du BIOS (que udev rend lisible
+/// sans droits administrateur). Vitesses en MT/s (« DDR5-6000 » = 6000).
+#[derive(Clone, Default, Debug, PartialEq)]
+struct RamKit {
+    kind: String, modules: u32, module_gb: f32,
+    /// Vitesse max annoncée par le BIOS, vitesse réglée, vitesse inscrite dans la référence.
+    speed: u32, configured: u32, rated: u32,
+    maker: String, part: String,
+}
+
+impl RamKit {
+    /// Vitesse la plus haute que les barrettes peuvent tenir, d'après ce qu'on sait.
+    fn max(&self) -> u32 { self.speed.max(self.rated).max(self.configured) }
+}
+
+/// Vitesse maximale sans profil XMP/EXPO (norme JEDEC des processeurs grand public).
+fn jedec_max(kind: &str) -> Option<u32> {
+    match kind { "DDR3" => Some(1600), "DDR4" => Some(3200), "DDR5" => Some(5600), _ => None }
+}
+
+/// Vitesse inscrite dans la référence du fabricant, repérée par « <vitesse>C<latence> »
+/// (ou J chez G.Skill) : CP16G60C36 → 6000, KF560C36 → 6000, CMK32GX5M2B6000C36 → 6000, F5-6000J3038 → 6000.
+fn rated_from_part(part: &str) -> u32 {
+    let b = part.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if !b[i].is_ascii_digit() { i += 1; continue; }
+        let start = i;
+        while i < b.len() && b[i].is_ascii_digit() { i += 1; }
+        let digits = &part[start..i];
+        let cl = i + 1 < b.len() && matches!(b[i], b'C' | b'J') && b[i + 1].is_ascii_digit();
+        if !cl { continue; }
+        let mts = match digits.len() {
+            2 => digits.parse::<u32>().unwrap_or(0) * 100,
+            3 => digits[1..].parse::<u32>().unwrap_or(0) * 100,
+            4 => digits.parse().unwrap_or(0),
+            _ => 0,
+        };
+        if (1600..=10000).contains(&mts) { return mts; }
+    }
+    0
+}
+
+/// Lit les propriétés MEMORY_DEVICE_* (format udev « E:CLÉ=VALEUR » ou « CLÉ=VALEUR »).
+fn parse_ram_kit(text: &str) -> RamKit {
+    let mut dev: HashMap<u32, HashMap<String, String>> = HashMap::new();
+    for l in text.lines() {
+        let l = l.trim().trim_start_matches("E:");
+        let Some(rest) = l.strip_prefix("MEMORY_DEVICE_") else { continue };
+        let Some((key, value)) = rest.split_once('=') else { continue };
+        let Some((n, field)) = key.split_once('_') else { continue };
+        let Ok(n) = n.parse() else { continue };
+        dev.entry(n).or_default().insert(field.to_string(), value.trim().to_string());
+    }
+    let mut kit = RamKit::default();
+    let mut ids: Vec<_> = dev.keys().copied().collect();
+    ids.sort();
+    for id in ids {
+        let d = &dev[&id];
+        let get = |k: &str| d.get(k).map(String::as_str).unwrap_or("");
+        let size: f64 = get("SIZE").parse().unwrap_or(0.0);
+        if size <= 0.0 { continue; } // emplacement vide
+        kit.modules += 1;
+        kit.module_gb = (size / 1073741824.0) as f32;
+        if kit.kind.is_empty() { kit.kind = get("TYPE").to_string(); }
+        let speed: u32 = get("SPEED_MTS").parse().unwrap_or(0);
+        let conf: u32 = get("CONFIGURED_SPEED_MTS").parse().unwrap_or(0);
+        kit.speed = kit.speed.max(speed);
+        // Plusieurs barrettes tournent toujours à la même vitesse : la plus basse fait foi.
+        if conf > 0 { kit.configured = if kit.configured == 0 { conf } else { kit.configured.min(conf) }; }
+        if kit.part.is_empty() { kit.part = get("PART_NUMBER").to_string(); }
+        if kit.maker.is_empty() { kit.maker = get("MANUFACTURER").to_string(); }
+    }
+    kit.rated = rated_from_part(&kit.part);
+    kit
+}
+
+fn ram_kit() -> RamKit {
+    let text = std::fs::read_to_string("/run/udev/data/+dmi:id").ok().filter(|t| t.contains("MEMORY_DEVICE_")).unwrap_or_else(|| {
+        Command::new("udevadm").args(["info", "--query=property", "--path=/sys/class/dmi/id"]).output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).to_string()).unwrap_or_default()
+    });
+    parse_ram_kit(&text)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Xmp {
+    /// Au-dessus de la norme JEDEC : un profil XMP (Intel) ou EXPO (AMD) est actif.
+    On,
+    /// Les barrettes peuvent aller plus vite que leur réglage actuel.
+    Off,
+    /// Vitesse standard, et rien n'indique que les barrettes peuvent faire mieux.
+    Standard,
+    Unknown,
+}
+
+fn xmp_state(k: &RamKit) -> Xmp {
+    if k.configured == 0 { return Xmp::Unknown; }
+    if k.max() > k.configured + 50 { return Xmp::Off; }
+    match jedec_max(&k.kind) {
+        Some(j) if k.configured > j => Xmp::On,
+        Some(_) => Xmp::Standard,
+        None => Xmp::Unknown,
+    }
+}
+
+/// Mémoire utilisée et totale, en Go (Gio), d'après /proc/meminfo.
+fn ram_usage() -> Option<(f32, f32)> {
+    let info = std::fs::read_to_string("/proc/meminfo").ok()?;
+    let kb = |key: &str| info.lines().find_map(|l| l.strip_prefix(key)).and_then(|v| v.trim().trim_end_matches("kB").trim().parse::<f32>().ok());
+    let (total, avail) = (kb("MemTotal:")?, kb("MemAvailable:")?);
+    Some(((total - avail) / 1048576.0, total / 1048576.0))
+}
+
+/// Température des barrettes (capteur des DDR5, ou jc42 sur certaines DDR4), en °C.
+fn ram_temp() -> Option<f32> {
+    std::fs::read_dir("/sys/class/hwmon").ok()?.flatten().filter_map(|e| {
+        let name = std::fs::read_to_string(e.path().join("name")).ok()?;
+        if !matches!(name.trim(), "spd5118" | "jc42") { return None; }
+        read_f(&e.path().join("temp1_input")).map(|v| v / 1000.0)
+    }).reduce(f32::max)
+}
+
 /// Le reste du PC (carte mère, mémoire, SSD, ventilateurs, USB), en W, et le
 /// rendement typique d'une alimentation 80 Plus Gold à charge moyenne.
 const REST_W: f32 = 35.0;
@@ -246,6 +444,10 @@ struct Live {
     cpu_w_max: f32,
     total_max: f32,
     peaks: HashMap<String, Peaks>,
+    ram: RamKit,
+    /// Mémoire utilisée / totale (Go), température des barrettes.
+    ram_used: Option<(f32, f32)>,
+    ram_temp: Option<f32>,
 }
 
 impl Live {
@@ -258,7 +460,7 @@ impl Live {
 
 fn spawn_monitor(ctx: egui::Context) -> Arc<Mutex<Live>> {
     let live = Arc::new(Mutex::new(Live { gpus: Err("Lecture des cartes graphiques…".into()), cpu: Cpu { name: cpu_name(), ..Default::default() },
-        cpu_max: 0.0, cpu_w_max: 0.0, total_max: 0.0, peaks: HashMap::new() }));
+        cpu_max: 0.0, cpu_w_max: 0.0, total_max: 0.0, peaks: HashMap::new(), ram: ram_kit(), ram_used: ram_usage(), ram_temp: None }));
     let shared = live.clone();
     let mut prev = cpu_times();
     // Secondes passées au-dessus de PL1 : au-delà de la durée de pointe, le processeur redescend à PL1.
@@ -278,7 +480,10 @@ fn spawn_monitor(ctx: egui::Context) -> Arc<Mutex<Live>> {
             if watts > pl1 { above_pl1 += 1.0; if above_pl1 > tau { watts = pl1; } } else { above_pl1 = 0.0; }
         }
         let temp = cpu_temp();
+        let (ram_used, ram_t) = (ram_usage(), ram_temp());
         if let Ok(mut l) = shared.lock() {
+            l.ram_used = ram_used;
+            l.ram_temp = ram_t;
             if let Ok(list) = &gpus {
                 for g in list {
                     let p = l.peaks.entry(g.uuid.clone()).or_default();
@@ -335,18 +540,51 @@ fn unit_for<'a>(units: &'a [Unit], g: &Gpu) -> Option<&'a Unit> {
     units.iter().find(|u| u.target == g.uuid || u.target == g.index.to_string())
 }
 
+/// Service d'overclocking : « ExecStart=… gpu-oc.py <UUID> <graphique> <mémoire> ».
+#[derive(Clone, Debug, PartialEq)]
+struct OcUnit { file: String, uuid: String, core: i32, mem: i32, enabled: bool }
+
+fn parse_oc_unit(text: &str) -> Option<(String, i32, i32)> {
+    text.lines().find_map(|l| {
+        let words: Vec<&str> = l.trim().strip_prefix("ExecStart=")?.split_whitespace().collect();
+        let i = words.iter().position(|w| w.ends_with("gpu-oc.py"))?;
+        Some((words.get(i + 1)?.to_string(), words.get(i + 2)?.parse().ok()?, words.get(i + 3)?.parse().ok()?))
+    })
+}
+
+fn read_oc_units() -> Vec<OcUnit> {
+    let Ok(dir) = std::fs::read_dir(UNIT_DIR) else { return vec![] };
+    dir.flatten().filter_map(|e| {
+        let file = e.file_name().to_string_lossy().to_string();
+        if !file.starts_with(OC_PREFIX) || !file.ends_with(".service") { return None; }
+        let (uuid, core, mem) = parse_oc_unit(&std::fs::read_to_string(e.path()).ok()?)?;
+        let enabled = Command::new("systemctl").args(["is-enabled", &file]).output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "enabled").unwrap_or(false);
+        Some(OcUnit { file, uuid, core, mem, enabled })
+    }).collect()
+}
+
 #[derive(Clone)]
-enum Job { Apply { w: u32, uuid: String }, Persist { w: u32, uuid: String, unit: String }, Remove { w: u32, uuid: String, unit: String } }
+enum Job {
+    Apply { w: u32, uuid: String }, Persist { w: u32, uuid: String, unit: String }, Remove { w: u32, uuid: String, unit: String },
+    Oc { uuid: String, core: i32, mem: i32 }, OcPersist { uuid: String, core: i32, mem: i32, unit: String }, OcRemove { uuid: String, unit: String },
+}
 
 fn run_job(job: &Job) -> Result<String, String> {
     if Command::new("pkexec").arg("--version").output().is_err() {
         return Err("pkexec est introuvable : impossible de demander les droits administrateur.".into());
+    }
+    if matches!(job, Job::Oc { .. } | Job::OcPersist { .. } | Job::OcRemove { .. }) && !std::path::Path::new(PYTHON).exists() {
+        return Err(format!("{PYTHON} est introuvable : il sert à régler les fréquences de la carte."));
     }
     let mut cmd = Command::new("pkexec");
     match job {
         Job::Apply { w, uuid } => cmd.args([nvsmi(), "-i".into(), uuid.clone(), "-pl".into(), w.to_string()]),
         Job::Persist { w, uuid, unit } => cmd.args(["/bin/sh", "-c", PERSIST_SCRIPT, "sh", &w.to_string(), uuid, unit]),
         Job::Remove { w, uuid, unit } => cmd.args(["/bin/sh", "-c", REMOVE_SCRIPT, "sh", &w.to_string(), uuid, unit]),
+        Job::Oc { uuid, core, mem } => cmd.args([PYTHON, "-I", "-c", OC_PY, uuid, &core.to_string(), &mem.to_string()]),
+        Job::OcPersist { uuid, core, mem, unit } => cmd.args(["/bin/sh", "-c", OC_PERSIST_SCRIPT, "sh", uuid, &core.to_string(), &mem.to_string(), unit, OC_PY]),
+        Job::OcRemove { uuid, unit } => cmd.args(["/bin/sh", "-c", OC_REMOVE_SCRIPT, "sh", uuid, unit, OC_PY]),
     };
     let out = cmd.output().map_err(|e| format!("Impossible de lancer pkexec ({e})."))?;
     match out.status.code() {
@@ -354,6 +592,10 @@ fn run_job(job: &Job) -> Result<String, String> {
             Job::Apply { w, .. } => format!("Limite réglée à {w} W jusqu'au prochain redémarrage."),
             Job::Persist { w, .. } => format!("Limite réglée à {w} W, et gardée au démarrage et après la veille."),
             Job::Remove { w, .. } => format!("Réglage permanent retiré, carte revenue à {w} W."),
+            Job::Oc { core: 0, mem: 0, .. } => "Fréquences d'origine remises.".into(),
+            Job::Oc { core, mem, .. } => format!("Overclocking appliqué (+{core} MHz graphique, +{mem} MHz mémoire) jusqu'au prochain redémarrage. Teste en jouant !"),
+            Job::OcPersist { core, mem, .. } => format!("Overclocking appliqué (+{core} / +{mem} MHz), gardé au démarrage et après la veille."),
+            Job::OcRemove { .. } => "Overclocking retiré : fréquences d'origine.".into(),
         }),
         Some(126) | Some(127) => Err("Autorisation annulée ou refusée.".into()),
         _ => {
@@ -394,6 +636,29 @@ const PRESETS: [(&str, &str, f32); 4] = [
     ("D'origine", "100 %", 1.00),
 ];
 
+/// Paliers d'overclocking : (prudent, courant, élevé), en MHz de décalage.
+/// Au-delà du palier « élevé », presque toutes les cartes deviennent instables.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct OcSteps { core: [i32; 3], mem: [i32; 3] }
+
+fn oc_steps(name: &str) -> OcSteps {
+    // Les RTX 50 gagnent plus de MHz que les RTX 30/40 avant de décrocher.
+    let core = if name.contains("RTX 50") { [150, 300, 400] } else { [100, 200, 300] };
+    OcSteps { core, mem: [1000, 2000, 3000] }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, PartialOrd)]
+enum Risk { Origin, Safe, Typical, High, Unstable }
+
+fn risk(v: i32, steps: [i32; 3]) -> Risk {
+    if v <= 0 { Risk::Origin } else if v <= steps[0] { Risk::Safe } else if v <= steps[1] { Risk::Typical } else if v <= steps[2] { Risk::High } else { Risk::Unstable }
+}
+
+/// Le curseur va un peu au-delà du palier « élevé » (zone rouge), sans dépasser ce que le pilote permet.
+fn oc_caps(s: &OcSteps, o: &nvml::Offsets) -> (i32, i32) {
+    ((s.core[2] + 100).min(o.core_range.1).max(0), (s.mem[2] + 500).min(o.mem_range.1).max(0))
+}
+
 // ---------------------------------------------------------------- interface
 
 struct App {
@@ -403,6 +668,11 @@ struct App {
     target: Option<f32>,
     job: Option<mpsc::Receiver<Result<String, String>>>,
     msg: Option<Result<String, String>>,
+    oc_units: Vec<OcUnit>,
+    /// Décalages lus sur la carte sélectionnée (UUID, résultat).
+    oc_now: Option<(String, Result<nvml::Offsets, String>)>,
+    /// Réglage en cours sur les curseurs : (graphique, mémoire).
+    oc_target: Option<(i32, i32)>,
     hook: TestHook,
     update: SelfUpdate,
 }
@@ -410,7 +680,7 @@ struct App {
 impl App {
     fn new(cc: &eframe::CreationContext) -> Self {
         style(&cc.egui_ctx);
-        App { live: spawn_monitor(cc.egui_ctx.clone()), units: read_units(), selected: String::new(), target: None, job: None, msg: None, hook: TestHook::default(), update: SelfUpdate::new() }
+        App { live: spawn_monitor(cc.egui_ctx.clone()), units: read_units(), selected: String::new(), target: None, job: None, msg: None, oc_units: read_oc_units(), oc_now: None, oc_target: None, hook: TestHook::default(), update: SelfUpdate::new() }
     }
 
     fn start(&mut self, job: Job, ctx: &egui::Context) {
@@ -488,22 +758,29 @@ impl eframe::App for App {
                 self.msg = Some(res);
                 self.job = None;
                 self.units = read_units();
+                self.oc_units = read_oc_units();
+                self.oc_now = None;
             }
         }
         let live = self.live.lock().map(|l| l.clone()).unwrap_or_else(|e| e.into_inner().clone());
         let gpus = live.gpus.as_ref().ok().cloned().unwrap_or_default();
         if !gpus.iter().any(|g| g.uuid == self.selected) {
-            if let Some(g) = gpus.first() { self.selected = g.uuid.clone(); self.target = None; }
+            if let Some(g) = gpus.first() { self.selected = g.uuid.clone(); self.target = None; self.oc_target = None; }
         }
         let gpu = gpus.iter().find(|g| g.uuid == self.selected).cloned();
         if let (None, Some(g)) = (self.target, &gpu) {
             let saved = unit_for(&self.units, g).map(|u| u.watts as f32);
             self.target = Some(saved.unwrap_or(g.limit).clamp(g.min.min(g.limit), g.max.max(g.limit)));
         }
+        if let Some(g) = &gpu {
+            if self.oc_now.as_ref().map_or(true, |(u, _)| *u != g.uuid) { self.oc_now = Some((g.uuid.clone(), nvml::offsets(&g.uuid))); }
+        }
         let busy = self.job.is_some();
 
         egui::CentralPanel::default().frame(egui::Frame::new().fill(BG).inner_margin(Margin::same(18))).show(ctx, |ui| {
-            egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+            let mut scroll = egui::ScrollArea::vertical().auto_shrink(false);
+            if let Some(y) = self.hook.scroll.filter(|_| self.hook.path.is_some()) { scroll = scroll.vertical_scroll_offset(y); }
+            scroll.show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("PowerCap").size(28.0).strong());
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -514,6 +791,7 @@ impl eframe::App for App {
                                     if ui.selectable_label(g.uuid == self.selected, format!("{} · {}", g.index, g.name)).clicked() && g.uuid != self.selected {
                                         self.selected = g.uuid.clone();
                                         self.target = None;
+                                        self.oc_target = None;
                                     }
                                 }
                             });
@@ -556,6 +834,41 @@ impl eframe::App for App {
                         tile(&mut c[2], "Fréquences", format!("{:.1} GHz", cpu.freq), format!("processeur, max {:.1} GHz", cpu.max_freq), TEXT);
                     });
                     small(ui, "Les « max vu » comptent depuis l'ouverture de PowerCap : laisse-le ouvert pendant une partie pour voir les pics.");
+                });
+                ui.add_space(10.0);
+
+                // --- Mémoire vive
+                card(ui, "Mémoire vive", |ui| {
+                    let k = &live.ram;
+                    let xmp = xmp_state(k);
+                    let kit = if k.modules > 0 { format!("{} × {:.0} Go {}", k.modules, k.module_gb, k.kind) } else { "barrettes non détectées".into() };
+                    ui.columns(3, |c| {
+                        match live.ram_used {
+                            Some((used, total)) => tile(&mut c[0], "Utilisée", format!("{used:.1} / {total:.1} Go"), format!("{:.0} % · {kit}", used / total * 100.0), temp_color(used / total, 0.80, 0.92)),
+                            None => tile(&mut c[0], "Utilisée", "—".into(), kit, MUTED),
+                        }
+                        if k.configured > 0 {
+                            tile(&mut c[1], "Fréquence", format!("{} MT/s", k.configured), format!("max {} MT/s", k.max()), if xmp == Xmp::Off { WARM } else { TEXT });
+                        } else {
+                            tile(&mut c[1], "Fréquence", "—".into(), "non lisible".into(), MUTED);
+                        }
+                        let (name, sub, color) = match xmp {
+                            Xmp::On => ("XMP actif", "profil de la barrette", ACCENT),
+                            Xmp::Off => ("XMP désactivé", "vitesse standard (JEDEC)", WARM),
+                            Xmp::Standard => ("Standard", "JEDEC, sans XMP", TEXT),
+                            Xmp::Unknown => ("—", "non déterminé", MUTED),
+                        };
+                        tile(&mut c[2], "Profil", name.into(), sub.into(), color);
+                    });
+                    match xmp {
+                        Xmp::On => { ui.label(RichText::new(format!("La mémoire tourne à {} MT/s, au-dessus de la norme ({} MT/s) : le profil XMP (ou EXPO chez AMD) est bien activé dans le BIOS.", k.configured, jedec_max(&k.kind).unwrap_or(0))).color(ACCENT)); }
+                        Xmp::Off => { ui.label(RichText::new(format!("La mémoire tourne à {} MT/s alors qu'elle est prévue pour {} MT/s : active le profil XMP dans le BIOS (ASUS : Ai Tweaker → Ai Overclock Tuner → XMP I ; AMD : EXPO).", k.configured, k.max())).color(WARM)); }
+                        Xmp::Standard => small(ui, "Vitesse standard. Si la boîte de tes barrettes annonce plus (par ex. 6000 MT/s), active le profil XMP dans le BIOS."),
+                        Xmp::Unknown => {}
+                    }
+                    let mut info = [k.maker.as_str(), k.part.as_str()].iter().filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("Not Specified")).copied().collect::<Vec<_>>().join(" ");
+                    if let Some(t) = live.ram_temp { info = if info.is_empty() { format!("barrettes à {t:.0} °C") } else { format!("{info} · barrettes à {t:.0} °C") }; }
+                    small(ui, format!("{}MT/s = mégatransferts par seconde, le chiffre des boîtes (DDR5-6000 = 6000 MT/s, soit 3000 MHz réels).", if info.is_empty() { String::new() } else { format!("{info}. ") }));
                 });
                 ui.add_space(10.0);
 
@@ -658,6 +971,153 @@ impl eframe::App for App {
                 }
                 ui.add_space(10.0);
 
+                // --- Overclocking
+                card(ui, "Overclocking de la carte (facultatif)", |ui| {
+                    let oc_unit = self.oc_units.iter().find(|u| u.uuid == g.uuid).cloned();
+                    let now = match self.oc_now.as_ref().map(|(_, r)| r.clone()) {
+                        Some(Ok(o)) => o,
+                        Some(Err(e)) => {
+                            ui.label(RichText::new("Overclocking indisponible sur cette carte.").strong().color(MUTED));
+                            small(ui, e);
+                            return;
+                        }
+                        None => return,
+                    };
+                    let active = now.core != 0 || now.mem != 0;
+                    if active {
+                        ui.label(RichText::new(format!("Actif : +{} MHz processeur graphique, +{} MHz mémoire vidéo", now.core, now.mem)).strong().color(ACCENT));
+                    } else {
+                        ui.label(RichText::new("Pas d'overclocking : la carte tourne à ses fréquences d'origine.").color(MUTED));
+                    }
+                    match &oc_unit {
+                        Some(u) if u.enabled => small(ui, format!("Gardé au démarrage : +{} / +{} MHz.", u.core, u.mem)),
+                        Some(u) => small(ui, format!("Réglage de démarrage présent (+{} / +{} MHz) mais désactivé.", u.core, u.mem)),
+                        None if active => small(ui, "Seulement jusqu'au prochain redémarrage."),
+                        None => {}
+                    }
+
+                    let steps = oc_steps(&g.name);
+                    let (core_cap, mem_cap) = oc_caps(&steps, &now);
+                    let (mut core, mut mem) = self.oc_target.unwrap_or_else(|| oc_unit.as_ref().map(|u| (u.core, u.mem)).unwrap_or((now.core, now.mem)));
+                    // Carte bridée en watts : l'overclocking ne chauffe pas plus, il récupère des images/s.
+                    let limited = g.adjustable() && g.limit < g.default * 0.97;
+                    egui::CollapsingHeader::new(RichText::new("Afficher les réglages").strong()).id_salt(("oc", &g.uuid)).default_open(active).show(ui, |ui| {
+                        let boxed = |ui: &mut egui::Ui, add: &mut dyn FnMut(&mut egui::Ui)| {
+                            egui::Frame::new().fill(CARD2).corner_radius(CornerRadius::same(10)).inner_margin(Margin::same(12)).show(ui, |ui| {
+                                ui.set_width(ui.available_width());
+                                add(ui);
+                            });
+                        };
+                        boxed(ui, &mut |ui| {
+                            ui.label(RichText::new("À quoi ça sert ?").strong());
+                            small(ui, "La carte fait tourner ses puces un peu plus vite que prévu à l'usine : quelques images/s en plus, gratuitement.");
+                            if limited {
+                                ui.label(RichText::new(format!("Ta carte est limitée à {:.0} W ({:.0} % de l'origine) : l'overclocking ne la fera pas chauffer plus, elle reste plafonnée à {:.0} W. Elle tire simplement plus d'images/s de ces mêmes watts, et rattrape une partie de ce que la limite fait perdre.", g.limit, g.limit / g.default * 100.0, g.limit)).color(ACCENT));
+                            } else {
+                                ui.label(RichText::new(format!("Ta carte est à sa puissance d'origine ({:.0} W) : elle gagne quelques images/s et chauffe un peu plus, sans jamais dépasser {:.0} W.", g.limit, g.limit)).color(TEXT));
+                                if g.adjustable() {
+                                    small(ui, format!("Astuce : limite « Équilibré » ({:.0} W) + overclocking « Prudent » = presque toutes les performances, avec moins de chaleur et de bruit.", preset_watts(&g, 0.8)));
+                                }
+                            }
+                            ui.add_space(4.0);
+                            ui.label(RichText::new("Sans danger pour la carte").strong());
+                            small(ui, "Elle garde sa tension maximale, sa limite de watts et sa protection contre la surchauffe : PowerCap n'y touche pas. Si on va trop loin, le jeu plante ou l'image se dérègle, rien de plus.");
+                        });
+                        ui.add_space(6.0);
+                        boxed(ui, &mut |ui| {
+                            ui.label(RichText::new("Comment faire").strong());
+                            for (i, s) in [
+                                "Clique sur « Prudent » ci-dessous.",
+                                "Clique sur « Essayer maintenant » (mot de passe demandé).",
+                                "Joue au moins 30 min à un jeu exigeant.",
+                                "Aucun souci ? Clique sur « Garder au démarrage ». Un plantage ? Redémarre le PC : l'essai s'efface tout seul.",
+                            ].iter().enumerate() {
+                                small(ui, format!("{}. {s}", i + 1));
+                            }
+                        });
+                        ui.add_space(8.0);
+                        ui.spacing_mut().slider_width = ui.available_width();
+                        let slider = |ui: &mut egui::Ui, label: &str, hint: &str, v: &mut i32, cap: i32, step: f64, steps: [i32; 3]| {
+                            let color = match risk(*v, steps) { Risk::Origin => TEXT, Risk::Safe | Risk::Typical => ACCENT, Risk::High => WARM, Risk::Unstable => HOT };
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new(label).strong());
+                                ui.label(RichText::new(format!("+{v} MHz")).strong().color(color));
+                            });
+                            small(ui, hint);
+                            ui.add(egui::Slider::new(v, 0..=cap).step_by(step).show_value(false));
+                            ui.horizontal(|ui| {
+                                small(ui, format!("vert jusqu'à +{}, orange jusqu'à +{}, rouge au-delà", steps[1], steps[2]));
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| small(ui, format!("+{cap}")));
+                            });
+                        };
+                        slider(ui, "Processeur graphique", "Le cœur de la carte : c'est lui qui donne le plus d'images/s.", &mut core, core_cap, 5.0, steps.core);
+                        ui.add_space(4.0);
+                        let mem_hint = if limited { "Gain plus faible. Avec une limite de watts réduite, elle prend des watts au processeur graphique : reste vers +500 à +1000." } else { "Gain plus faible, surtout utile en haute résolution." };
+                        slider(ui, "Mémoire vidéo", mem_hint, &mut mem, mem_cap, 50.0, steps.mem);
+                        ui.add_space(4.0);
+                        let presets = [("D'origine", "aucun", 0usize), ("Prudent", "conseillé", 1), ("Courant", "à tester", 2)];
+                        ui.columns(presets.len(), |c| {
+                            for (i, (name, hint, lvl)) in presets.iter().enumerate() {
+                                let (pc, pm) = if *lvl == 0 { (0, 0) } else { (steps.core[lvl - 1], steps.mem[lvl - 1]) };
+                                let sel = core == pc && mem == pm;
+                                let text = RichText::new(format!("{name}\n+{pc} / +{pm}\n{hint}")).size(13.0).color(if sel { ACCENT } else { TEXT });
+                                let b = egui::Button::new(text).min_size(egui::vec2(c[i].available_width(), 62.0))
+                                    .fill(if sel { ACCENT_DIM } else { CARD2 }).stroke(Stroke::new(1.0_f32, if sel { ACCENT } else { LINE }));
+                                if c[i].add(b).clicked() { core = pc; mem = pm; }
+                            }
+                        });
+                        ui.add_space(6.0);
+                        let (rc, rm) = (risk(core, steps.core), risk(mem, steps.mem));
+                        let worst = if rc > rm { rc } else { rm };
+                        boxed(ui, &mut |ui| {
+                            let (line, color) = match worst {
+                                Risk::Origin => ("Fréquences d'origine : rien à tester.", TEXT),
+                                Risk::Safe => ("Prudent : la quasi-totalité des cartes le tiennent. Gain ≈ +2 à 4 % d'images/s.", ACCENT),
+                                Risk::Typical => ("Courant : beaucoup de cartes le tiennent, mais chacune est différente. Teste bien avant de le garder. Gain ≈ +4 à 6 %.", ACCENT),
+                                Risk::High => ("Élevé : beaucoup de cartes plantent ici (jeu qui se ferme, écran noir, petits carrés colorés). Sans danger pour la carte, mais à tester longuement.", WARM),
+                                Risk::Unstable => ("Trop haut : le jeu ou le PC va presque sûrement planter. Ça n'abîme pas la carte, mais ce réglage ne peut pas être gardé au démarrage.", HOT),
+                            };
+                            ui.label(RichText::new(line).strong().color(color));
+                            if rm >= Risk::High {
+                                small(ui, "Mémoire vidéo trop poussée : elle corrige ses erreurs en silence et les images/s baissent au lieu de monter.");
+                            } else if limited && mem > steps.mem[0] {
+                                small(ui, format!("Avec la limite à {:.0} W, au-delà de +{} sur la mémoire vidéo le gain est souvent nul : mieux vaut monter le processeur graphique.", g.limit, steps.mem[0]));
+                            }
+                        });
+                        ui.add_space(8.0);
+                        if (core, mem) != (now.core, now.mem) {
+                            ui.label(RichText::new("Pas encore appliqué : clique sur « Essayer maintenant ».").color(WARM));
+                        } else if active {
+                            ui.label(RichText::new("Ce réglage est appliqué en ce moment.").color(ACCENT));
+                        }
+                        let half = (ui.available_width() - 10.0) / 2.0;
+                        let persist_ok = worst != Risk::Unstable && worst != Risk::Origin;
+                        ui.horizontal(|ui| {
+                            if big_button(ui, !busy, "Essayer maintenant", false, half) {
+                                self.start(Job::Oc { uuid: g.uuid.clone(), core, mem }, ui.ctx());
+                            }
+                            if big_button(ui, !busy && persist_ok, "Garder au démarrage", true, half) {
+                                self.start(Job::OcPersist { uuid: g.uuid.clone(), core, mem, unit: g.oc_unit() }, ui.ctx());
+                            }
+                        });
+                        if active || oc_unit.is_some() {
+                            ui.add_space(4.0);
+                            if big_button(ui, !busy, if oc_unit.is_some() { "Tout remettre d'origine (et retirer du démarrage)" } else { "Remettre les fréquences d'origine" }, false, ui.available_width()) {
+                                let job = match &oc_unit {
+                                    Some(u) => Job::OcRemove { uuid: g.uuid.clone(), unit: u.file.clone() },
+                                    None => Job::Oc { uuid: g.uuid.clone(), core: 0, mem: 0 },
+                                };
+                                core = 0;
+                                mem = 0;
+                                self.start(job, ui.ctx());
+                            }
+                        }
+                        small(ui, format!("Fréquences en ce moment : {:.0} MHz (processeur graphique) · {:.0} MHz (mémoire). Au repos elles sont basses, c'est normal : elles montent en jeu.", g.clock, g.mem_clock));
+                    });
+                    self.oc_target = Some((core, mem));
+                });
+                ui.add_space(10.0);
+
                 // --- Démarrage
                 card(ui, "Au démarrage", |ui| {
                     let unit = unit_for(&self.units, &g).cloned();
@@ -722,8 +1182,9 @@ impl eframe::App for App {
 // ---------------------------------------------------------------- tests
 
 /// Pour les tests seulement : `APP_SCREENSHOT=/chemin.png` enregistre une
-/// capture après `APP_SCREENSHOT_DELAY` s (3 par défaut) puis ferme l'app.
-struct TestHook { path: Option<String>, delay: f32, start: Instant, requested: bool }
+/// capture après `APP_SCREENSHOT_DELAY` s (3 par défaut) puis ferme l'app ;
+/// `APP_SCREENSHOT_SCROLL=<px>` fait d'abord défiler la page.
+struct TestHook { path: Option<String>, delay: f32, start: Instant, requested: bool, scroll: Option<f32> }
 
 impl Default for TestHook {
     fn default() -> Self {
@@ -731,6 +1192,7 @@ impl Default for TestHook {
             path: std::env::var("APP_SCREENSHOT").ok().filter(|s| !s.is_empty()),
             delay: std::env::var("APP_SCREENSHOT_DELAY").ok().and_then(|s| s.parse().ok()).unwrap_or(3.0),
             start: Instant::now(), requested: false,
+            scroll: std::env::var("APP_SCREENSHOT_SCROLL").ok().and_then(|s| s.parse().ok()),
         }
     }
 }
@@ -760,18 +1222,19 @@ mod tests {
 
     #[test]
     fn parses_nvidia_smi_lines() {
-        let g = parse_gpu("0, GPU-ebab68d5-d9c6-1718-88bf-c79a87a14bc7, NVIDIA GeForce RTX 4070, 21.24, 200.00, 200.00, 100.00, 216.00, 39, 0, 2490, 3").unwrap();
+        let g = parse_gpu("0, GPU-ebab68d5-d9c6-1718-88bf-c79a87a14bc7, NVIDIA GeForce RTX 4070, 21.24, 200.00, 200.00, 100.00, 216.00, 39, 0, 2490, 10501, 3").unwrap();
         assert_eq!(g.name, "NVIDIA GeForce RTX 4070");
-        assert_eq!((g.limit, g.default, g.min, g.max), (200.0, 200.0, 100.0, 216.0));
+        assert_eq!((g.limit, g.default, g.min, g.max, g.mem_clock, g.util), (200.0, 200.0, 100.0, 216.0, 10501.0, 3.0));
         assert!(g.adjustable());
         assert_eq!(g.unit(), "powercap-gpu-ebab68d5.service");
+        assert_eq!(g.oc_unit(), "powercap-oc-ebab68d5.service");
         // Carte de portable : limites non disponibles.
-        let g = parse_gpu("1, GPU-1234, NVIDIA GeForce RTX 4060 Laptop GPU, [N/A], [N/A], [N/A], [N/A], [N/A], 40, [N/A], 0, 0").unwrap();
+        let g = parse_gpu("1, GPU-1234, NVIDIA GeForce RTX 4060 Laptop GPU, [N/A], [N/A], [N/A], [N/A], [N/A], 40, [N/A], 0, 0, 0").unwrap();
         assert_eq!((g.index, g.draw), (1, 0.0));
         assert!(!g.adjustable());
         // Nom avec virgule.
-        let g = parse_gpu("0, GPU-x, A, B, 1, 2, 3, 4, 5, 6, 7, 8, 9").unwrap();
-        assert_eq!((g.name.as_str(), g.util), ("A, B", 9.0));
+        let g = parse_gpu("0, GPU-x, A, B, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10").unwrap();
+        assert_eq!((g.name.as_str(), g.util), ("A, B", 10.0));
         assert!(parse_gpu("rien").is_err());
     }
 
@@ -814,10 +1277,54 @@ mod tests {
     }
 
     #[test]
+    fn ram_and_xmp() {
+        for (part, mts) in [("CP16G60C36U5B.M8D1", 6000), ("KF560C36BBE-16", 6000), ("CMK32GX5M2B6000C36", 6000),
+            ("F5-6000J3038F16G", 6000), ("KF432C16BB/8", 3200), ("BL8G32C16U4B", 3200), ("M425R2GA3BB0-CQKOL", 0)] {
+            assert_eq!(rated_from_part(part), mts, "{part}");
+        }
+        let dmi = "E:MEMORY_DEVICE_0_SIZE=17179869184\nE:MEMORY_DEVICE_0_TYPE=DDR5\nE:MEMORY_DEVICE_0_SPEED_MTS=6000\n\
+            E:MEMORY_DEVICE_0_CONFIGURED_SPEED_MTS=6000\nE:MEMORY_DEVICE_0_PART_NUMBER=CP16G60C36U5B.M8D1\n\
+            E:MEMORY_DEVICE_0_MANUFACTURER=Micron Technology\nE:MEMORY_DEVICE_1_SIZE=17179869184\n\
+            E:MEMORY_DEVICE_1_CONFIGURED_SPEED_MTS=6000\nE:MEMORY_DEVICE_2_SIZE=0\n";
+        let k = parse_ram_kit(dmi);
+        assert_eq!((k.modules, k.module_gb, k.kind.as_str(), k.configured, k.max()), (2, 16.0, "DDR5", 6000, 6000));
+        assert_eq!(xmp_state(&k), Xmp::On);
+        // Même kit, XMP coupé : le BIOS règle 4800 alors que la barrette fait 6000.
+        let off = RamKit { speed: 4800, configured: 4800, ..k.clone() };
+        assert_eq!(xmp_state(&off), Xmp::Off);
+        let plain = RamKit { kind: "DDR4".into(), speed: 3200, configured: 3200, rated: 0, ..Default::default() };
+        assert_eq!(xmp_state(&plain), Xmp::Standard);
+        assert_eq!(xmp_state(&RamKit::default()), Xmp::Unknown);
+    }
+
+    #[test]
+    fn overclocking() {
+        assert_eq!(parse_oc_unit("[Service]\nExecStart=/usr/bin/python3 -I /etc/powercap/gpu-oc.py GPU-ab-cd 150 1000\n"), Some(("GPU-ab-cd".into(), 150, 1000)));
+        assert_eq!(parse_oc_unit("ExecStart=/usr/bin/nvidia-smi -pl 150"), None);
+        let s = oc_steps("NVIDIA GeForce RTX 4070");
+        assert_eq!([0, 100, 150, 300, 305].map(|v| risk(v, s.core)), [Risk::Origin, Risk::Safe, Risk::Typical, Risk::High, Risk::Unstable]);
+        assert_eq!(risk(3500, s.mem), Risk::Unstable);
+        assert!(oc_steps("NVIDIA GeForce RTX 5070").core[0] > s.core[0]);
+        // Curseurs : un peu au-delà du palier élevé, jamais au-delà du pilote.
+        let o = nvml::Offsets { core_range: (-1000, 1000), mem_range: (-2000, 6000), ..Default::default() };
+        assert_eq!(oc_caps(&s, &o), (400, 3500));
+        let tight = nvml::Offsets { core_range: (0, 250), mem_range: (0, 1500), ..Default::default() };
+        assert_eq!(oc_caps(&s, &tight), (250, 1500));
+    }
+
+    #[test]
     fn scripts_are_valid_shell() {
-        for s in [PERSIST_SCRIPT, REMOVE_SCRIPT] {
+        for s in [PERSIST_SCRIPT, REMOVE_SCRIPT, OC_PERSIST_SCRIPT, OC_REMOVE_SCRIPT] {
             let ok = Command::new("sh").args(["-n", "-c", s]).status().map(|s| s.success()).unwrap_or(true);
             assert!(ok);
+        }
+        let ok = Command::new("python3").args(["-I", "-c", "import ast, sys; ast.parse(sys.argv[1])", OC_PY]).status().map(|s| s.success()).unwrap_or(true);
+        assert!(ok);
+        // Le script refuse ce qui n'est pas une carte ou une valeur permise, avant de toucher au pilote.
+        for args in [["rm -rf", "0", "0"], ["GPU-ab", "5000", "0"], ["GPU-ab", "0", "-5"]] {
+            if let Ok(out) = Command::new("python3").args(["-I", "-c", OC_PY]).args(args).output() {
+                assert!(!out.status.success(), "{args:?}");
+            }
         }
     }
 }

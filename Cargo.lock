@@ -1948,7 +1948,7 @@ dependencies = [
 
 [[package]]
 name = "powercap"
-version = "1.0.3"
+version = "1.0.4"
 dependencies = [
  "eframe",
  "egui",
